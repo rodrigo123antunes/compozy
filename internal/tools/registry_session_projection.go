@@ -63,6 +63,9 @@ func (r *RuntimeRegistry) bootstrapRequiresDeferredDiscovery(
 		}
 	}
 	if inputs.Session.Enforced {
+		if len(inputs.Session.MCPServers) > 0 {
+			return true, nil
+		}
 		for _, requiredID := range inputs.Session.Tools {
 			if !containsToolID(projected, requiredID) {
 				return true, nil
@@ -86,6 +89,7 @@ func (r *RuntimeRegistry) sessionProjection(
 	includeProvider func(Provider) bool,
 	includeEntry func(*registryEntry) bool,
 ) ([]ToolView, error) {
+	ctx = withPolicyResolutionCache(ctx)
 	index, err := r.buildIndexMatching(ctx, scope, includeProvider)
 	if err != nil {
 		return nil, err

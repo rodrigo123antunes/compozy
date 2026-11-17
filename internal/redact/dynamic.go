@@ -18,13 +18,30 @@ var dynamicSecrets = newDynamicSecretRegistry()
 type dynamicSecretRegistry struct {
 	mu       sync.Mutex
 	values   map[string]int
-	snapshot atomic.Value
+	snapshot atomic.Pointer[secretSnapshot]
+}
+
+// secretSnapshot pairs the registered secrets with their reversible encodings,
+// derived once per change because redaction reads them for every string.
+type secretSnapshot struct {
+	values    []string
+	encodings []string
 }
 
 func newDynamicSecretRegistry() *dynamicSecretRegistry {
 	registry := &dynamicSecretRegistry{values: make(map[string]int)}
-	registry.snapshot.Store([]string(nil))
+	registry.snapshot.Store(&secretSnapshot{})
 	return registry
+}
+
+// ContainsRegisteredSecret reports whether value contains runtime-registered secret material.
+func ContainsRegisteredSecret(value string) bool {
+	for _, secret := range dynamicSecrets.valuesSnapshot() {
+		if strings.Contains(value, secret) {
+			return true
+		}
+	}
+	return false
 }
 
 // RegisterDynamicSecret registers heuristic runtime material and returns an idempotent cleanup.
@@ -80,13 +97,13 @@ func (r *dynamicSecretRegistry) storeSnapshotLocked() {
 	slices.SortFunc(secrets, func(a, b string) int {
 		return cmp.Or(cmp.Compare(len(b), len(a)), cmp.Compare(a, b))
 	})
-	r.snapshot.Store(secrets)
+	r.snapshot.Store(&secretSnapshot{values: secrets, encodings: secretEncodings(secrets)})
 }
 
 func (r *dynamicSecretRegistry) valuesSnapshot() []string {
-	secrets, ok := r.snapshot.Load().([]string)
-	if !ok {
-		return nil
-	}
-	return secrets
+	return r.snapshot.Load().values
+}
+
+func (r *dynamicSecretRegistry) encodingsSnapshot() []string {
+	return r.snapshot.Load().encodings
 }

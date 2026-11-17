@@ -912,6 +912,84 @@ describe("useSessionLiveTail", () => {
     expect(result.current.messages).toHaveLength(6);
   });
 
+  it("Should keep every loaded message object when a live entry rolls the page boundaries", async () => {
+    const messages = Array.from({ length: 5 }, (_, index) =>
+      textMessage(`rolled-${index + 1}`, `Rolled message ${index + 1}`)
+    );
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    queryClient.setQueryData(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID),
+      seededTranscriptData(
+        transcriptPage(messages.slice(2, 4), {
+          firstSequence: 3,
+          hasOlder: true,
+          nextBeforeSequence: 3,
+          limit: 2,
+        }),
+        transcriptPage(messages.slice(0, 2), { firstSequence: 1, limit: 2 })
+      )
+    );
+    const { result, sources } = renderLiveTail({ queryClient });
+    await waitFor(() => expect(result.current.messages).toHaveLength(4));
+    const loaded = [...result.current.messages];
+
+    // The first tool call of a turn opens its entry: the full head passes its
+    // oldest entry on, and every full page shifts by one.
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 5,
+          entries: [{ message: messages[4]!, sequence: 5, start_sequence: 5 }],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 5,
+          session_id: SESSION_ID,
+        },
+        "5"
+      );
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(5));
+
+    const data = queryClient.getQueryData<SessionTranscriptData>(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID)
+    );
+    expect(data?.pages.map(page => page.entries.length)).toEqual([2, 2, 1]);
+    loaded.forEach((message, index) => {
+      expect(result.current.messages[index]).toBe(message);
+    });
+
+    // Later tool calls update that entry in place: only it gets a new object.
+    const appended = result.current.messages[4];
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 6,
+          entries: [
+            {
+              message: textMessage("rolled-5", "Rolled message 5 revised"),
+              sequence: 6,
+              start_sequence: 5,
+            },
+          ],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 6,
+          session_id: SESSION_ID,
+        },
+        "6"
+      );
+    });
+    await waitFor(() => expect(result.current.messages[4]).not.toBe(appended));
+    loaded.forEach((message, index) => {
+      expect(result.current.messages[index]).toBe(message);
+    });
+  });
+
   it("Should advance the cache cursor for an empty delta and reconnect from cache fences", async () => {
     vi.useFakeTimers();
     const queryClient = createQueryClient();
@@ -1050,10 +1128,12 @@ describe("useSessionLiveTail", () => {
     const queryClient = createQueryClient();
     seedActiveSession(queryClient);
     const rosterKey = sessionKeys.subagentRoster(WORKSPACE_ID, SESSION_ID);
+    queryClient.setQueryData<SubagentRoster>(rosterKey, { rows: [], staleIds: new Set() });
     const { result, sources } = renderLiveTail({ queryClient });
     await act(async () => {
       await vi.waitFor(() => expect(result.current.status).toBe("success"));
     });
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)?.snapshotPending).toBe(true);
     const subagent = {
       subagent_id: "sub-1",
       workspace_id: WORKSPACE_ID,
@@ -1115,6 +1195,82 @@ describe("useSessionLiveTail", () => {
       sources[1]?.emit("subagents_snapshot", { session_id: SESSION_ID, subagents: [subagent] });
     });
     expect(queryClient.getQueryData<SubagentRoster>(rosterKey)?.staleIds.size).toBe(0);
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)?.snapshotPending).not.toBe(true);
+    act(() => sources[1]?.emit("subagents_snapshot", { session_id: SESSION_ID, subagents: [] }));
+    act(() => sources[1]?.onerror?.(new Event("error")));
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)).toMatchObject({
+      rows: [],
+      snapshotPending: true,
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(sources).toHaveLength(3);
+    act(() => sources[2]!.emit("subagents_snapshot", { session_id: SESSION_ID, subagents: [] }));
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)?.snapshotPending).not.toBe(true);
+  });
+
+  // Invariant: `subagent_removed` drops exactly its row from the stream-owned roster and
+  // rereads the branch/list; a frame naming another session leaves this roster untouched.
+  // Owning layer: session live-tail stream orchestration; canonical suite: this hook's suite.
+  it("Should drop a removed subagent row and ignore another session's removal", () => {
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const rosterKey = sessionKeys.subagentRoster(WORKSPACE_ID, SESSION_ID);
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+    const { sources } = renderLiveTail({ queryClient });
+    const row = (id: string, title: string) =>
+      ({
+        subagent_id: id,
+        parent_session_id: SESSION_ID,
+        child_session_id: `child-${id}`,
+        origin: "delegated",
+        title,
+        role: "",
+        status: "running",
+        work_state: "working",
+        progress: "",
+        result: null,
+        result_preview: "",
+        result_truncated: false,
+        error: null,
+        runtime: {},
+        depth: 1,
+        started_at: "2026-10-08T21:00:00.000Z",
+        settled_at: null,
+        created_at: "2026-10-08T21:00:00.000Z",
+        updated_at: "2026-10-08T21:00:01.000Z",
+        delivery: "none",
+      }) as never;
+
+    act(() => {
+      sources[0]?.emit("subagents_snapshot", {
+        session_id: SESSION_ID,
+        subagents: [row("sub-1", "Audit webhooks"), row("sub-2", "Read schema")],
+      });
+    });
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)?.rows.map(item => item.id)).toEqual([
+      "sub-1",
+      "sub-2",
+    ]);
+
+    act(() => {
+      sources[0]?.emit("subagent_removed", { session_id: "sess-other", subagent_id: "sub-1" });
+    });
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)?.rows).toHaveLength(2);
+
+    act(() => {
+      sources[0]?.emit("subagent_removed", { session_id: SESSION_ID, subagent_id: "sub-1" });
+    });
+    const removed = queryClient.getQueryData<SubagentRoster>(rosterKey);
+    expect(removed?.rows.map(item => item.id)).toEqual(["sub-2"]);
+    expect(removed?.staleIds.size).toBe(0);
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: sessionKeys.subagentBranch(WORKSPACE_ID, SESSION_ID),
+      exact: true,
+    });
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: sessionKeys.subagents(WORKSPACE_ID, SESSION_ID),
+      exact: true,
+    });
   });
 
   it("Should wake only the exact session command projection", async () => {

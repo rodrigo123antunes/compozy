@@ -50,8 +50,10 @@ type Resolver struct {
 	unregister            *unregisterCoordinator
 	mu                    sync.RWMutex
 	cache                 map[string]*cachedEntry
+	snapshotsHeld         bool
 	agentConfigCache      map[string]*cachedAgentConfig
 	agentConfigGeneration uint64
+	skillsConfigCache     map[string]*cachedSkillsConfig
 }
 
 var _ RuntimeResolver = (*Resolver)(nil)
@@ -95,6 +97,7 @@ func NewResolver(store Store, opts ...Option) (*Resolver, error) {
 		unregister:          newUnregisterCoordinator(),
 		cache:               make(map[string]*cachedEntry),
 		agentConfigCache:    make(map[string]*cachedAgentConfig),
+		skillsConfigCache:   make(map[string]*cachedSkillsConfig),
 	}, nil
 }
 
@@ -377,6 +380,7 @@ func (r *Resolver) Invalidate(workspaceID string) {
 			delete(r.agentConfigCache, key)
 		}
 	}
+	r.deleteSkillsConfigLocked(trimmedID)
 	r.mu.Unlock()
 }
 
@@ -389,6 +393,7 @@ func (r *Resolver) InvalidateAll() {
 	r.agentConfigGeneration++
 	clear(r.cache)
 	clear(r.agentConfigCache)
+	clear(r.skillsConfigCache)
 	r.mu.Unlock()
 }
 
@@ -468,6 +473,7 @@ func (c *cachedEntry) canReuse(ws Workspace, scan workspaceScan) bool {
 func (r *Resolver) evictExpiredLocked(now time.Time) {
 	cutoff := now.Add(-r.cacheTTL)
 	r.evictAgentConfigCacheLocked(cutoff)
+	r.evictSkillsConfigCacheLocked(cutoff)
 	for workspaceID, entry := range r.cache {
 		if entry.lastAccess.Before(cutoff) {
 			r.logger.Debug("workspace.cache.evict",

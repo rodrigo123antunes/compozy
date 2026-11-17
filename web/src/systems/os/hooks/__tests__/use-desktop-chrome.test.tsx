@@ -6,7 +6,9 @@
 // since mount, never the cached window list a returning destination starts from;
 // an explicit switch into one profile closes, once each of its desks is live, exactly the
 // session, terminal, pinned agent and automation windows another profile owns, finishing a
-// desk's interrupted or partly unread sweep and stopping on a rolled-back switch (#1184, #1194).
+// desk's interrupted or partly unread sweep and stopping on a rolled-back switch (#1184, #1194);
+// a re-registration refocuses the window this page had focused until that applies, the window is
+// gone or focus moved elsewhere meanwhile, retrying a refused focus on the next revision (#1655).
 // Boundary IN: chrome hook projection reads and provider ownership.
 // Boundary OUT: window-manager stream, client registration, and rendered DesktopShell.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -37,7 +39,8 @@ const unreadableSessions = vi.hoisted(() => new Set<string>());
 vi.mock("@tanstack/react-router", () => ({
   useRouter: () => ({
     options: { stringifySearch: () => "" },
-    history: { replace: vi.fn(), push: vi.fn() },
+    history: { replace: vi.fn(), push: vi.fn(), subscribe: () => () => undefined },
+    subscribe: () => () => undefined,
   }),
 }));
 
@@ -180,6 +183,10 @@ import type { OsDesktopRuntimeStore, OsWindow } from "../../lib/os-types";
 import type { WindowManagerSnapshot } from "../../lib/window-manager-types";
 import { useDesktopChrome } from "../use-desktop-chrome";
 import { useProfileSwitchWindowSweep } from "../use-profile-switch-window-sweep";
+import {
+  useRestoredClientFocus,
+  type RestoredClientFocusInput,
+} from "../use-restored-client-focus";
 import { useWindowScopePruning } from "../use-window-scope-pruning";
 
 function wrapper() {
@@ -228,6 +235,18 @@ describe("useDesktopChrome", () => {
     const { result } = renderHook(() => useDesktopChrome("ws_a"), { wrapper: wrapper() });
 
     expect(useProfileSwitchWindowSweep).toHaveBeenLastCalledWith(result.current.shell, "ws_a");
+  });
+
+  it("Should hand the All projects partition to the terminal close guard", async () => {
+    // #1712: the desktop controller names no terminal workspace under All projects;
+    // the guard must still know it is the aggregate, or unbound windows are trapped.
+    // Imported here so the module graph loads in the order the mocks above expect.
+    const { TerminalWindowClose } = await import("../../lib/terminal-window-close");
+    const guard = vi.spyOn(TerminalWindowClose.prototype, "guard");
+    renderHook(() => useDesktopChrome("global", null), { wrapper: wrapper() });
+
+    expect(guard).toHaveBeenLastCalledWith("global", expect.anything());
+    guard.mockRestore();
   });
 
   it("Should read no workspace overlay on the User partition", () => {
@@ -650,5 +669,70 @@ describe("useProfileSwitchWindowSweep", () => {
     rerender({ partition: "ws_a" });
     act(() => goLive());
     await waitFor(() => expect(closed).toEqual(["w_xray"]));
+  });
+});
+
+describe("useRestoredClientFocus", () => {
+  function restoreHarness(focusedId: string | null, windows: string[]) {
+    const state = {
+      client: {},
+      focusedId,
+      windows: Object.fromEntries(windows.map(id => [id, { id }])),
+    };
+    const answers: Array<(applied: boolean) => void> = [];
+    const focusWindow = vi.fn(() => ({
+      completion: new Promise<boolean>(resolve => answers.push(resolve)),
+    }));
+    const manager = {
+      getState: () => state,
+      focusWindow,
+    } as unknown as RestoredClientFocusInput["manager"];
+    const settle = vi.fn();
+    const { rerender } = renderHook(
+      ({ revision }) =>
+        useRestoredClientFocus({
+          manager,
+          restoredFocus: "win-w",
+          settle,
+          snapshotRevision: revision,
+          client: state.client,
+        }),
+      { initialProps: { revision: 1 } }
+    );
+    return { state, focusWindow, answers, settle, rerender };
+  }
+
+  it("Should retry a refused focus on the next snapshot revision until it applies", async () => {
+    const harness = restoreHarness("win-default", ["win-default", "win-w"]);
+    expect(harness.focusWindow).toHaveBeenCalledWith("win-w", { replaceable: true });
+
+    // One in flight at a time: a revision that lands meanwhile sends nothing.
+    harness.rerender({ revision: 2 });
+    expect(harness.focusWindow).toHaveBeenCalledOnce();
+    await act(async () => harness.answers[0]?.(false));
+    expect(harness.settle).not.toHaveBeenCalled();
+
+    harness.rerender({ revision: 3 });
+    expect(harness.focusWindow).toHaveBeenCalledTimes(2);
+    await act(async () => harness.answers[1]?.(true));
+    expect(harness.settle).toHaveBeenCalledWith("win-w");
+  });
+
+  it("Should settle without a focus when the window is gone or already focused", () => {
+    expect(restoreHarness("win-default", ["win-default"]).settle).toHaveBeenCalledWith("win-w");
+    const focused = restoreHarness("win-w", ["win-w"]);
+    expect(focused.focusWindow).not.toHaveBeenCalled();
+    expect(focused.settle).toHaveBeenCalledWith("win-w");
+  });
+
+  it("Should give up once focus moves to another window before the restore applies", async () => {
+    const harness = restoreHarness("win-default", ["win-default", "win-w", "win-x"]);
+    await act(async () => harness.answers[0]?.(false));
+
+    // The operator focused a window meanwhile: a late restore must not take it back.
+    harness.state.focusedId = "win-x";
+    harness.rerender({ revision: 2 });
+    expect(harness.focusWindow).toHaveBeenCalledOnce();
+    expect(harness.settle).toHaveBeenCalledWith("win-w");
   });
 });

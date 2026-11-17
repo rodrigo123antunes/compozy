@@ -90,16 +90,18 @@ type HostedService struct {
 	now                  func() time.Time
 	nonceReader          func([]byte) error
 
-	launches          map[string]*hostedLaunchRecord
-	binds             map[string]*hostedBindRecord
-	projectionCache   hostedProjectionCache
-	sharedProjections hostedSharedProjectionCache
+	launches           map[string]*hostedLaunchRecord
+	binds              map[string]*hostedBindRecord
+	projectionCache    hostedProjectionCache
+	sharedProjections  hostedSharedProjectionCache
+	projectionListings hostedProjectionListings
 	// bindReleases wakes projection streams when binds are released so they end promptly.
 	bindReleases changeSignal
 }
 
 // HostedLaunchRequest describes one session-bound MCP launch.
 type HostedLaunchRequest struct {
+	EagerTools  bool
 	SessionID   string
 	ProfileID   string
 	WorkspaceID string
@@ -114,16 +116,18 @@ type HostedBindRequest struct {
 
 // HostedBindResponse proves a hosted proxy has bound to one launch record.
 type HostedBindResponse struct {
-	BindID string           `json:"bind_id"`
-	Scope  tools.Scope      `json:"scope"`
-	Tools  []tools.ToolView `json:"tools"`
-	Digest string           `json:"digest"`
+	Catalog tools.AdvertisedCatalog `json:"catalog"`
+	BindID  string                  `json:"bind_id"`
+	Scope   tools.Scope             `json:"scope"`
+	Tools   []tools.ToolView        `json:"tools"`
+	Digest  string                  `json:"digest"`
 }
 
 // HostedProjectionResponse is a full session-callable projection snapshot.
 type HostedProjectionResponse struct {
-	Tools  []tools.ToolView `json:"tools"`
-	Digest string           `json:"digest"`
+	Catalog tools.AdvertisedCatalog `json:"catalog"`
+	Tools   []tools.ToolView        `json:"tools"`
+	Digest  string                  `json:"digest"`
 }
 
 // HostedCallRequest invokes one hosted MCP tool through the registry.
@@ -146,37 +150,48 @@ type HostedReleaseRequest struct {
 }
 
 type hostedLaunchRecord struct {
-	readiness     changeSignal
-	readyBindID   string
-	sessionID     string
-	profileID     string
-	workspaceID   string
-	agentName     string
-	nonceHash     string
-	expiresAt     time.Time
-	armed         bool
-	expectedBin   string
-	createdAt     time.Time
-	established   bool
-	correlationID string
-	runID         string
-	generation    int64
-	bindID        string
+	eagerTools       bool
+	projectionFailed bool
+	readiness        changeSignal
+	readyBindID      string
+	sessionID        string
+	profileID        string
+	workspaceID      string
+	agentName        string
+	nonceHash        string
+	expiresAt        time.Time
+	armed            bool
+	expectedBin      string
+	createdAt        time.Time
+	established      bool
+	everBound        bool
+	correlationID    string
+	runID            string
+	generation       int64
+	bindID           string
+	// runTrace lives exactly as long as runID: set by BindRun, moved to last by ReleaseRun.
+	runTrace hostedRunTrace
 }
 
 type hostedBindRecord struct {
-	digestMemo    *hostedProjectionDigestMemo
-	bindID        string
-	sessionID     string
-	profileID     string
-	workspaceID   string
-	agentName     string
-	expectedBin   string
-	peer          PeerInfo
-	createdAt     time.Time
-	correlationID string
-	runID         string
-	generation    int64
+	initialToolDigest string
+	initialCatalog    tools.AdvertisedCatalog
+	servedDigest      string
+	initialDeadline   time.Time
+	eagerTools        bool
+	digestMemo        *hostedProjectionDigestMemo
+	bindID            string
+	sessionID         string
+	profileID         string
+	workspaceID       string
+	agentName         string
+	expectedBin       string
+	peer              PeerInfo
+	createdAt         time.Time
+	correlationID     string
+	runID             string
+	generation        int64
+	runTrace          hostedRunTrace
 }
 
 // NewHostedService builds a hosted MCP lifecycle service.
@@ -246,6 +261,7 @@ func (s *HostedService) Launch(ctx context.Context, req HostedLaunchRequest) (co
 	}
 	now := s.now().UTC()
 	record := &hostedLaunchRecord{
+		eagerTools:    req.EagerTools,
 		sessionID:     sessionID,
 		profileID:     strings.TrimSpace(req.ProfileID),
 		workspaceID:   strings.TrimSpace(req.WorkspaceID),

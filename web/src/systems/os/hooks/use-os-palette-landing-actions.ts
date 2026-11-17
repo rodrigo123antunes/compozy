@@ -1,5 +1,9 @@
 import { notifyUser } from "@/lib/user-feedback";
-import { consumeChooseSessionTerminalQuote, requestSessionLinkDialog } from "@/systems/session";
+import {
+  consumeChooseSessionTerminalQuote,
+  requestSessionLinkDialog,
+  requestSessionParentPicker,
+} from "@/systems/session";
 import {
   DESTINATION_COPY,
   ownerDataScope,
@@ -45,11 +49,9 @@ export function useOsPaletteLandingActions({
   }) => {
     if (destinationWindowId === null) return;
     windowManagerStore.trigger.paletteIntentCleared();
-    void coordinator
-      .userOpen({ ...target, stackTargetWindowId: destinationWindowId })
-      .then(openedId => {
-        if (openedId !== null) void manager.closeWindow(destinationWindowId);
-      });
+    void coordinator.userOpen({ ...target, afterWindowId: destinationWindowId }).then(openedId => {
+      if (openedId !== null) void manager.closeWindow(destinationWindowId);
+    });
   };
   const landSession = (session: OsPaletteSessionResult) => {
     if (session.busy) return;
@@ -101,6 +103,10 @@ export function useOsPaletteLandingActions({
     linkSession: (sessionId: string) => {
       close();
       requestSessionLinkDialog(sessionId);
+    },
+    moveSession: (sessionId: string) => {
+      close();
+      requestSessionParentPicker(sessionId);
     },
     pickDestination,
     selectWorktree: (entry: OsPaletteWorktreeResult) => {

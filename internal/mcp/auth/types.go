@@ -133,9 +133,13 @@ const authTypeOAuth = "oauth"
 
 // ServerConfig is the token-free auth configuration used by the OAuth service.
 type ServerConfig struct {
+	DefinitionDigest        string
+	ConsentScope            ConsentScope
+	Implicit                bool
 	Target                  Target
 	Transport               string
 	RemoteURL               string
+	DisplayRemoteURL        string
 	CatalogEntry            string
 	Type                    string
 	IssuerURL               string
@@ -265,7 +269,7 @@ func ServerConfigFromMCP(
 	if err := server.Validate("mcp_server"); err != nil {
 		return ServerConfig{}, err
 	}
-	if server.Auth.IsZero() {
+	if !OAuthCapable(server) {
 		return ServerConfig{
 			Target:    target,
 			Transport: string(server.EffectiveTransport()),
@@ -295,6 +299,7 @@ func ServerConfigFromMCP(
 	}
 
 	return ServerConfig{
+		Implicit:        server.Auth.IsZero(),
 		Target:          target,
 		Transport:       string(server.EffectiveTransport()),
 		RemoteURL:       strings.TrimSpace(server.URL),
@@ -307,6 +312,12 @@ func ServerConfigFromMCP(
 		Scopes:          trimStrings(server.Auth.Scopes),
 		Registration:    RegistrationStrategy(server.Auth.Registration),
 	}, nil
+}
+
+// OAuthCapable preserves explicit policy and limits implicit discovery to header-free remotes.
+func OAuthCapable(server compozyconfig.MCPServer) bool {
+	return server.EffectiveTransport() == compozyconfig.MCPServerTransportHTTP &&
+		(!server.Auth.IsZero() || (len(server.Headers) == 0 && len(server.SecretHeaders) == 0))
 }
 
 // ServerConfigsFromMCP returns auth service configs for every auth-enabled MCP
@@ -470,4 +481,11 @@ func issuersEqual(left string, right string) bool {
 		strings.TrimSpace(right),
 		"/",
 	)
+}
+
+func (c ServerConfig) publicRemoteURL() string {
+	if c.DisplayRemoteURL != "" {
+		return strings.TrimSpace(c.DisplayRemoteURL)
+	}
+	return strings.TrimSpace(c.RemoteURL)
 }

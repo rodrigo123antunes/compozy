@@ -20,9 +20,62 @@ import (
 )
 
 type mcpToolListCache struct {
+	publicationMu    sync.Mutex
+	attempts         map[string]mcpListAttempt
 	mu               sync.Mutex
 	entries          map[string]mcpToolListCacheEntry
 	projectionStates map[string]mcpToolProjectionState
+}
+
+type mcpListAttempt struct {
+	check, list uint64
+	active      int
+}
+
+func (e *CallExecutor) beginToolList(key string, fresh bool) mcpListAttempt {
+	e.toolCache.publicationMu.Lock()
+	defer e.toolCache.publicationMu.Unlock()
+	if e.toolCache.attempts == nil {
+		e.toolCache.attempts = make(map[string]mcpListAttempt)
+	}
+	attempt := e.toolCache.attempts[key]
+	if fresh {
+		attempt.check++
+	}
+	attempt.list++
+	attempt.active++
+	e.toolCache.attempts[key] = attempt
+	return attempt
+}
+
+func (e *CallExecutor) finishToolList(key string) {
+	e.toolCache.publicationMu.Lock()
+	defer e.toolCache.publicationMu.Unlock()
+	current := e.toolCache.attempts[key]
+	current.active--
+	if current.active == 0 {
+		delete(e.toolCache.attempts, key)
+	} else {
+		e.toolCache.attempts[key] = current
+	}
+}
+
+func (e *CallExecutor) publishToolList(key string, attempt mcpListAttempt, fresh bool,
+	source toolspkg.SourceRef, authorizationHeader string, descriptors []toolspkg.MCPToolDescriptor, ttlMs int,
+) error {
+	e.toolCache.publicationMu.Lock()
+	defer e.toolCache.publicationMu.Unlock()
+	current := e.toolCache.attempts[key]
+	if current.check != attempt.check || (!fresh && current.list != attempt.list) {
+		return nil
+	}
+	if fresh {
+		current.list++
+		e.toolCache.attempts[key] = current
+	}
+	now := time.Now()
+	e.cacheTools(key, descriptors, ttlMs, now)
+	return e.recordToolProjection(source, authorizationHeader, descriptors, ttlMs, now)
 }
 
 type mcpToolListCacheEntry struct {
@@ -50,6 +103,10 @@ func (e *CallExecutor) cachedTools(key string, now time.Time) ([]toolspkg.MCPToo
 
 func (e *CallExecutor) cacheTools(key string, descriptors []toolspkg.MCPToolDescriptor, ttlMs int, now time.Time) {
 	if ttlMs <= 0 {
+		// An uncacheable answer still supersedes what an earlier listing cached for this key.
+		e.toolCache.mu.Lock()
+		delete(e.toolCache.entries, key)
+		e.toolCache.mu.Unlock()
 		return
 	}
 	e.toolCache.mu.Lock()
@@ -177,7 +234,7 @@ func (e *CallExecutor) projectionSourceKey(
 	if err != nil {
 		return "", false
 	}
-	return mcpProjectionSourceKey(source, e.authorizationHeader(ctx, resolved)), true
+	return mcpProjectionSourceKey(source, e.authorizationHeader(ctx, &resolved)), true
 }
 
 func (e *CallExecutor) pruneToolProjectionStatesLocked(now time.Time) {
@@ -208,7 +265,7 @@ func mcpProjectionSourceKey(source toolspkg.SourceRef, authorizationHeader strin
 
 func (e *CallExecutor) toolCacheKey(
 	ctx context.Context,
-	resolved ResolvedServer,
+	resolved *ResolvedServer,
 	protocolVersion string,
 	authorizationHeader string,
 ) (string, error) {
@@ -236,7 +293,7 @@ func (e *CallExecutor) toolCacheKey(
 	}
 	authBinding := sha256.Sum256([]byte(authorizationHeader))
 	key := targetKey + "\x00" +
-		fingerprint + "\x00" +
+		fingerprint + "\x00" + string(resolved.overrideOrigin()) + "\x00" +
 		protocolVersion + "\x00" +
 		hex.EncodeToString(authBinding[:])
 	return key, nil
@@ -246,7 +303,7 @@ func (e *CallExecutor) toolCacheKey(
 // the protocol the pool negotiated with the same launch identity.
 func (e *CallExecutor) cachedPooledStdioTools(
 	ctx context.Context,
-	resolved ResolvedServer,
+	resolved *ResolvedServer,
 	authorizationHeader string,
 ) ([]toolspkg.MCPToolDescriptor, string, bool) {
 	if e.stdioPool == nil || resolved.Server.EffectiveTransport() != compozyconfig.MCPServerTransportStdio {

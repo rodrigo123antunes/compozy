@@ -6,6 +6,7 @@
 - Packaged inputs and server auth
 - Built-in open design
 - Portable Agent Plugins
+- Marketplace categories and Add
 - Install trust
 - Authoring and dev loop
 - Instance scoping
@@ -134,6 +135,15 @@ and install records the unused portable manifest as a note. Without a root manif
 `.cursor-plugin/plugin.json` are tried in that order. Their client grammar adapter loads skills
 from `skills/` and declared paths, and MCP servers from a contained `mcpServers` JSON file or
 inline map. Authored commands/agents/hooks emit `client_component_ignored` and are not loaded.
+When a client manifest omits `mcpServers`, a root `mcp.json` (preferred) or `.mcp.json` is loaded
+and reported as `client_mcp_discovered`; a plugin with no manifest loads default skills and root MCP
+file under its marketplace entry name. `${CLAUDE_PLUGIN_ROOT}`/`${CURSOR_PLUGIN_ROOT}` alias
+`${PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` aliases `${PLUGIN_DATA}`. Unsupported server fields are
+dropped with `client_field_ignored` instead of rejecting the server. `${NAME}` / `${NAME:-default}`
+in a server's `url`, `headers`, `env`, or `args` become typed plugin inputs: required unless
+defaulted, secret (vault ref) when the name ends in `KEY`, `TOKEN`, `SECRET`, or `PASSWORD`; bad
+names report `client_placeholder_invalid`. A remote server's `auth` (`CLIENT_ID`, `${CLIENT_SECRET}`,
+`scopes`) maps to its OAuth configuration.
 Package bytes are unchanged; provenance records the selected layout. Layout grants no trust.
 
 Portable ingestion synthesizes a resource-only extension from immediate child skills and `mcp.json`
@@ -161,14 +171,40 @@ directory is created immediately before its first stdio launch, survives updates
 remove. A failed deletion is renamed out of the reusable instance key and reported as a quarantine
 warning; if quarantine also fails, removal fails and the instance remains installed.
 
+## Marketplace Categories And Add
+
+Every catalog entry has exactly one category id: `productivity`, `communication`, `design`,
+`development`, `data`, `cloud`, `finance`, `sales-marketing`, `research`, `security`, `ai-agents`,
+`more`; `featured` is a reserved section fed only by CompozyOS-curated sources (`compozy-catalog`,
+`compozy-plugins`, which honor `x-compozy.category|featured|supersedes`). Listings carry `category`,
+`category_label`, and `featured`.
+
+- `compozy marketplace categories [query] -o json` / `compozy__marketplace_categories {query}`:
+  taxonomy with counts (human output hides zero counts; JSON keeps them, plus `featured`).
+- `compozy marketplace search --category <id>` / `compozy__marketplace_search {category}` /
+  `GET /api/marketplace?category=<id>`: one category, paged; the cursor binds the category. An
+  unknown id is `marketplace_category_unknown` (CLI exit 2, HTTP/UDS 400, tool error).
+- `GET /api/marketplace/sections?per_section=1..12`: the Browse home in one read.
+- Add = `compozy extension install <ref> --enable` / `compozy__extensions_install {enable: true}` /
+  `POST /api/extensions {"enable": true}`: install and enable in one operation. Every install gate
+  still applies (`extension_inputs_required`, consent, conflicts, gateway). If enabling fails after
+  install, the result is still success (`201`, exit 0) with `extension.enabled: false` and
+  `enable_error {error, code}`; the package stays installed. Retry with
+  `compozy extension enable <name>` / `compozy__extensions_enable`.
+- Setup state after Add: missing inputs via `compozy extension status <name>` /
+  `compozy__extensions_info`, servers waiting for sign-in via `compozy__mcp_auth_status`, then
+  `compozy mcp auth login <server>`. Do not report a plugin as ready from install success alone.
+
+Plugin sources accept `url` and `git-subdir` source objects and the Codex index
+`.agents/plugins/marketplace.json`; an unreadable shape is reported as `unsupported_source`.
+
 ## Install Trust
 
-Bundled upgrades migrate superseded registrations such as `dev-cycle` to `spec-cycle`, preserving
-compatible installation scopes and profile enablement. Conflicting enablement or untranslatable
-inputs and credentials retain the old registration; inspect `compozy doctor` and migrate that state
-before using its suggested removal command. Doctor names the actual workspace and profile attachment;
-`--global` removes a global attachment or recovers an unattached registration, not every workspace.
-Successor enrollment and scope transfer commit together. The bundled-name translation expires in v0.6.0.
+Starting in v0.6.1, bundled enrollment no longer transfers `dev-cycle` state to `spec-cycle`.
+Existing registrations, files, scopes, enablement, inputs and credentials remain intact.
+Inspect `compozy doctor` and migrate retained predecessor state before using its suggested
+removal command. Doctor names the actual workspace/profile attachment; `--global` does not
+remove every workspace attachment. Run v0.6.0 first if automatic compatible-state transfer is needed.
 
 One extension's startup failure remains visible in status without aborting another package's
 mutation. If a previous failed install left a package with no scoped installations, an operator
@@ -244,6 +280,20 @@ acquisition and inputs preserves package and input/secret before-images without 
 A different classified `(source_ref, entry_id)` returns `extension_name_conflict` with `installed_origin`;
 display names do not participate in identity. Only an operator may associate an unclassified managed
 installation with a catalog entry. Publication failure restores the old package and selected input cell.
+
+A local bundle replaces the installed package of the same name with
+`compozy extension install <path> --replace`, `POST /api/extensions` with
+`{"source": "local_path", "replace": true}`, or `compozy__extensions_install {replace: true}`. The
+replacement runs through the same transaction as a published reinstall: the previous directory,
+registry record, gateway confirmation, and selected input cell stay available until reload and the
+returned status step both succeed, so a failure inside that transaction after publication restores
+the previous version. Once the reinstall transaction returns successfully, a subsequent enable
+failure retains the new package. `replace` applies to `local_path` only; published
+sources already replace implicitly. It never converts a marketplace-owned name — that returns
+`extension_name_conflict` with `installed_origin`, so local bytes cannot silently inherit or drop
+marketplace provenance or update tracking — and a bundled package is refused with `extension_exists`.
+A replacement also does not enroll a new attachment: the target scope must already resolve, and only
+an operator may replace a package attached outside the caller's own workspace.
 
 For a configured plugin source, `compozy extension install team/tool --allow-unverified --yes`
 selects the source index and pins the listed digest before preview and installation. Existing curated
@@ -373,16 +423,16 @@ The `context.pre_compact` and `context.post_compact` hooks are observation-only 
 `compaction_trigger` (`requested` or `agent`); see `references/runtime-operations.md`. An `AGENT.md` hook
 cannot target them, because the agent definition adds `matcher.agent_name` and the context family does
 not accept it; declare context hooks in `config.toml`, an extension manifest, or a skill. The retired
-matcher keys `compaction_reason` and `compaction_strategy` are ignored in `AGENT.md`, `SKILL.md`, and
-extension manifest hooks with one `agent.retired_entries_ignored`,
-`skills.retired_entries_ignored`, or `extension.retired_entries_ignored` warning per owner, and archived
-in a `config.toml` (see `references/configuration.md`).
+matcher keys `compaction_reason` and `compaction_strategy` are rejected in v0.6.1 in every
+declaration source. Use `compaction_trigger`; invalid sources remain unchanged.
 
 Manage hooks with `compozy__hooks_*` (list/info/events/runs/create/update/delete/enable/disable). Workspace-scoped declarations match the registered workspace ID shown by `compozy workspace info`, the same ID carried by their event payloads. Hook families are documented beside their domain: `loop.*` in `references/loops.md`, and `window_manager.*` in `references/window-management.md`.
 
 The `agent.heartbeat.wake.before` hook accepts `cancel: true` for proactive `timer` and
 `instance_check` sources. Legacy `scheduler`, `manual`, and `harness_reentry` sources ignore
 cancellation. Dry-run checks skip this hook. Cancellation creates no triage occurrence.
+Heartbeat status includes both proactive sources in recent wake events, preserving their
+check results and reasons, including retained events written before upgrade.
 
 For proactive wake cancellation, hooks may return `{"cancel":true,"reason":"maintenance_window"}`.
 The persisted wake event keeps `hook_cancelled` as its reason and records the supplied text in

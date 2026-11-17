@@ -16,11 +16,152 @@ import (
 	"testing/synctest"
 	"time"
 
+	mcpauth "github.com/compozy/compozy/internal/mcp/auth"
 	"github.com/compozy/compozy/internal/tools"
 )
 
 func TestHostedServiceBindNonceLifecycle(t *testing.T) {
 	t.Parallel()
+	// Invariant: served-list receipts are scoped to the live authenticated binding.
+	// Owner: hosted service; canonical suite: TestHostedServiceBindNonceLifecycle (UT-039).
+	t.Run("Should isolate served receipts from newer catalog revisions and retired binds", func(t *testing.T) {
+		t.Parallel()
+		executable := hostedTestExecutable(t, "compozy")
+		view := hostedToolView("mcp__echo__ping")
+		view.Descriptor.Source = tools.SourceRef{
+			Kind:          tools.SourceMCP,
+			Owner:         "echo",
+			RawServerName: "echo",
+			RawToolName:   "ping",
+		}
+		registry := &hostedRegistryStub{views: []tools.ToolView{view}}
+		service := newHostedTestService(t, executable, registry, time.Now)
+		launch, err := service.Launch(t.Context(), HostedLaunchRequest{SessionID: "sess-receipt", EagerTools: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := service.ArmLaunch(t.Context(), "sess-receipt"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := service.ActivationCatalog(t.Context(), "sess-receipt"); err != nil {
+			t.Fatalf("initial unbound launch catalog: %v", err)
+		}
+		peer := hostedTestPeer(executable)
+		bound, err := service.Bind(
+			t.Context(),
+			HostedBindRequest{SessionID: "sess-receipt", Nonce: hostedLaunchNonce(t, launch.Args)},
+			peer,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := service.ReportServedCatalog(
+			t.Context(),
+			HostedServedRequest{BindID: bound.BindID, Digest: bound.Catalog.Digest},
+			peer,
+		); err != nil {
+			t.Fatal(err)
+		}
+		registry.replaceViews(nil)
+		current, served, err := service.ActivationCatalog(t.Context(), "sess-receipt")
+		if err != nil || served != bound.Catalog.Digest || current.Digest == served {
+			t.Fatalf("catalog=%+v served=%s err=%v", current, served, err)
+		}
+		captured, ok := service.BoundActivationCatalog("sess-receipt")
+		if !ok || captured.Digest != bound.Catalog.Digest {
+			t.Fatal("bind snapshot advanced before reload")
+		}
+		service.ReleaseBind(bound.BindID)
+		if _, _, err := service.ActivationCatalog(t.Context(), "sess-receipt"); !errors.Is(err, ErrHostedBindNotFound) {
+			t.Fatalf("lost proxy catalog = %v", err)
+		}
+		if err := service.ReportServedCatalog(
+			t.Context(),
+			HostedServedRequest{BindID: bound.BindID, Digest: current.Digest},
+			peer,
+		); !errors.Is(
+			err,
+			ErrHostedBindNotFound,
+		) {
+			t.Fatalf("retired receipt = %v", err)
+		}
+	})
+
+	t.Run("Should reuse eager discovery for the initial readiness receipt", func(t *testing.T) {
+		t.Parallel()
+		executable := hostedTestExecutable(t, "compozy")
+		registry := &hostedRegistryStub{views: []tools.ToolView{hostedToolView("compozy__hosted_echo")}}
+		now := time.Now()
+		service := newHostedTestService(t, executable, registry, func() time.Time { return now })
+		launch, err := service.Launch(t.Context(), HostedLaunchRequest{SessionID: "sess-eager", EagerTools: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := service.ArmLaunch(t.Context(), "sess-eager"); err != nil {
+			t.Fatal(err)
+		}
+		peer := hostedTestPeer(executable)
+		bound, err := service.Bind(
+			t.Context(),
+			HostedBindRequest{SessionID: "sess-eager", Nonce: hostedLaunchNonce(t, launch.Args)},
+			peer,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.ToolDigest(t.Context(), "sess-eager"); !errors.Is(err, errHostedBindPending) {
+			t.Fatalf("unconfirmed bind returned a comparable catalog: %v", err)
+		}
+		if _, err := service.StreamProjection(t.Context(), bound.BindID, peer, bound.Digest); err != nil {
+			t.Fatal(err)
+		}
+		if err := service.WaitForBind(t.Context(), "sess-eager"); err != nil {
+			t.Fatal(err)
+		}
+		if got := registry.listCallCount(); got != 1 {
+			t.Fatalf("initial discovery calls = %d, want 1", got)
+		}
+		initial, err := service.WaitForBindToolDigest(t.Context(), "sess-eager")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if digest, ready := service.InitialToolDigest("sess-eager"); !ready || digest != initial {
+			t.Fatal("lazy host did not receive the original bind digest")
+		}
+		registry.mu.Lock()
+		registry.err = errors.New("later refresh failed")
+		registry.mu.Unlock()
+		now = now.Add(HostedProjectionFallbackRefresh + time.Second)
+		if _, err := service.StreamProjection(t.Context(), bound.BindID, peer, bound.Digest); err == nil {
+			t.Fatal("refresh unexpectedly succeeded")
+		}
+		if _, err := service.WaitForBindToolDigest(t.Context(), "sess-eager"); err != nil {
+			t.Fatalf("refresh failed an already ready bind: %v", err)
+		}
+		registry.mu.Lock()
+		registry.err = nil
+		registry.mu.Unlock()
+		later := hostedToolView("mcp__docs__lookup")
+		later.Descriptor.Source = tools.SourceRef{
+			Kind:          tools.SourceMCP,
+			Owner:         "docs",
+			RawServerName: "docs",
+			RawToolName:   "lookup",
+		}
+		registry.replaceViews([]tools.ToolView{later})
+		now = now.Add(HostedProjectionFallbackRefresh + time.Second)
+		current, err := service.ToolDigest(t.Context(), "sess-eager")
+		if err != nil || current == initial {
+			t.Fatalf("changed projection digest = %q, %v", current, err)
+		}
+		receipt, err := service.WaitForBindToolDigest(t.Context(), "sess-eager")
+		if err != nil || receipt != initial {
+			t.Fatal("initial provider tools were replaced by later discovery")
+		}
+		if digest, ready := service.InitialToolDigest("sess-eager"); !ready || digest != initial {
+			t.Fatal("lazy host receipt was overwritten by the changed catalog")
+		}
+	})
 
 	t.Run("Should reject an unbound launch after its deadline", func(t *testing.T) {
 		t.Parallel()
@@ -45,6 +186,44 @@ func TestHostedServiceBindNonceLifecycle(t *testing.T) {
 		now = now.Add(time.Hour)
 		if err := service.WaitForBind(t.Context(), "sess-unbound"); !errors.Is(err, ErrHostedBindTimeout) {
 			t.Fatalf("WaitForBind() = %v, want bind timeout", err)
+		}
+	})
+
+	t.Run("Should fail readiness when the full projection fails", func(t *testing.T) {
+		t.Parallel()
+		executable := hostedTestExecutable(t, "compozy")
+		registry := &hostedRegistryStub{}
+		service := newHostedTestService(t, executable, registry, time.Now)
+		peer := hostedTestPeer(executable)
+		launch, err := service.Launch(
+			t.Context(),
+			HostedLaunchRequest{SessionID: "sess-projection-failed", EagerTools: true},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := service.ArmLaunch(t.Context(), "sess-projection-failed"); err != nil {
+			t.Fatal(err)
+		}
+		registry.mu.Lock()
+		upstreamErr := errors.New("private upstream error")
+		registry.err = upstreamErr
+		registry.mu.Unlock()
+		if _, err := service.Bind(
+			t.Context(),
+			HostedBindRequest{SessionID: "sess-projection-failed", Nonce: hostedLaunchNonce(t, launch.Args)},
+			peer,
+		); !errors.Is(err, upstreamErr) {
+			t.Fatalf("Bind error = %v, want the injected registry failure", err)
+		}
+		if err := service.WaitForBind(
+			t.Context(),
+			"sess-projection-failed",
+		); !errors.Is(
+			err,
+			ErrHostedProjectionFailed,
+		) {
+			t.Fatalf("readiness = %v, want safe projection failure", err)
 		}
 	})
 
@@ -903,9 +1082,126 @@ func TestHostedServiceProjectionAndCallUseRegistryScope(t *testing.T) {
 // Canonical suite: internal/mcp/hosted_test.go.
 func TestHostedServiceProjectionGenerationCache(t *testing.T) {
 	t.Parallel()
+	// Invariant: expiry with a refresh path retains hosted/proxy tools; sign-in required withdraws them.
+	// Owner: hosted projection and proxy reconciliation; canonical suite: projection generation cache.
+	t.Run(
+		"Should retain refreshable tools through transient failure and withdraw rejected credentials",
+		func(t *testing.T) {
+			t.Parallel()
+			remote := newTestMCPHTTPServer(newFakeSDKServer(nil))
+			t.Cleanup(remote.Close)
+			auth := &fakeAuthService{status: mcpauth.Status{Status: mcpauth.StatusAuthenticated, TokenPresent: true}}
+			executor := newTestMCPExecutor(t, authEnabledServer("echo", "http", remote.URL), withAuthService(auth))
+			source := tools.SourceRef{Kind: tools.SourceMCP, Owner: "echo", RawServerName: "echo", Scope: "user"}
+			provider, err := tools.NewMCPProvider(
+				tools.MCPSourceListerFunc(func(context.Context) ([]tools.SourceRef, error) {
+					return []tools.SourceRef{source}, nil
+				}),
+				executor,
+				executor,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policy := tools.DefaultPolicyInputs()
+			policy.ExternalDefault = tools.ExternalDefaultEnabled
+			policy.SystemPermissionMode = tools.PermissionModeApproveAll
+			registry, err := tools.NewRegistry(
+				tools.WithProviders(provider),
+				tools.WithPolicyInputs(policy, tools.ToolsetCatalog{}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			executable := hostedTestExecutable(t, "compozy")
+			service := newHostedTestServiceWithProjectionGeneration(t, executable, registry, nil)
+			epoch := NewProjectionEpoch()
+			service.projectionEpoch = epoch.Current
+			peer := hostedTestPeer(executable)
+			launch, err := service.Launch(
+				t.Context(),
+				HostedLaunchRequest{SessionID: "sess-refreshable", EagerTools: true},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.ArmLaunch(t.Context(), "sess-refreshable"); err != nil {
+				t.Fatal(err)
+			}
+			bound, err := service.Bind(t.Context(), HostedBindRequest{
+				SessionID: "sess-refreshable", Nonce: hostedLaunchNonce(t, launch.Args),
+			}, peer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(bound.Tools) != 1 {
+				t.Fatalf("initial tools = %d", len(bound.Tools))
+			}
+			if _, err := service.StreamProjection(t.Context(), bound.BindID, peer, bound.Digest); err != nil {
+				t.Fatal(err)
+			}
+			proxy := newHostedProxyTestServer()
+			client := &hostedProxyClientStub{}
+			registered := reconcileHostedTools(proxy, client, bound.BindID, nil, bound.Tools)
+			auth.mu.Lock()
+			auth.status = mcpauth.Status{Status: mcpauth.StatusExpired, TokenPresent: true, Refreshable: true}
+			auth.refreshErr = errors.New("temporary OAuth network failure")
+			auth.mu.Unlock()
+			epoch.Advance()
+			retained, err := service.StreamProjection(t.Context(), bound.BindID, peer, "")
+			if err != nil || retained.Catalog.Digest != bound.Catalog.Digest || len(retained.Tools) != 1 {
+				t.Fatalf("refreshable projection = %+v, %v", retained, err)
+			}
+			registered = reconcileHostedTools(proxy, client, bound.BindID, registered, retained.Tools)
+			if len(listHostedProxyTools(t, proxy)) != 1 {
+				t.Fatal("proxy withdrew a refreshable tool")
+			}
+			auth.mu.Lock()
+			auth.status = mcpauth.Status{Status: mcpauth.StatusNeedsLogin}
+			auth.mu.Unlock()
+			epoch.Advance()
+			withdrawn, err := service.StreamProjection(t.Context(), bound.BindID, peer, "")
+			if err != nil || len(withdrawn.Tools) != 0 || withdrawn.Digest == bound.Digest {
+				t.Fatalf("rejected projection = %+v, %v", withdrawn, err)
+			}
+			reconcileHostedTools(proxy, client, bound.BindID, registered, withdrawn.Tools)
+			if len(listHostedProxyTools(t, proxy)) != 0 {
+				t.Fatal("proxy retained a tool that needs sign-in")
+			}
+		},
+	)
+
+	t.Run("Should not cache a deferred bootstrap as a complete catalog generation", func(t *testing.T) {
+		t.Parallel()
+		executable := hostedTestExecutable(t, "compozy")
+		native, err := tools.NewNativeProvider(
+			tools.BuiltinSource(),
+			hostedRuntimeNativeTool("compozy__late", tools.RiskRead, true),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		registry, err := tools.NewRegistry(
+			tools.WithProviders(hostedDeferredProvider{native}),
+			tools.WithProjectionGeneration(func(context.Context, tools.Scope) (string, bool) { return "stable", true }),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		service := newHostedTestServiceWithProjectionGeneration(t, executable, registry, registry.ProjectionGeneration)
+		peer := hostedTestPeer(executable)
+		bound := hostedTestBind(t, service, "sess-deferred-catalog", peer)
+		if len(bound.Tools) != 0 {
+			t.Fatal("bootstrap unexpectedly discovered deferred tools")
+		}
+		projection, err := service.StreamProjection(t.Context(), bound.BindID, peer, bound.Digest)
+		if err != nil || !slices.Equal(hostedToolIDs(projection.Tools), []string{"compozy__late"}) {
+			t.Fatalf("complete projection = %+v, %v", projection, err)
+		}
+	})
 
 	for _, streams := range []int{1, 16} {
-		t.Run(fmt.Sprintf("Should build once per epoch for %d concurrent peers", streams), func(t *testing.T) {
+		t.Run(fmt.Sprintf("Should list providers once per epoch for %d concurrent peers", streams), func(t *testing.T) {
 			t.Parallel()
 			executable := hostedTestExecutable(t, "compozy")
 			native, err := tools.NewNativeProvider(tools.BuiltinSource(), hostedRuntimeNativeTool(
@@ -914,7 +1210,19 @@ func TestHostedServiceProjectionGenerationCache(t *testing.T) {
 				t.Fatal(err)
 			}
 			provider := &hostedCountingProvider{Provider: native}
-			registry, err := tools.NewRegistry(tools.WithProviders(provider))
+			var registry *tools.RuntimeRegistry
+			resolver := hostedPolicyResolver(func(ctx context.Context, scope tools.Scope) (tools.PolicyInputs, error) {
+				inputs := tools.DefaultPolicyInputs()
+				scope.SessionID, scope.AgentName = "", ""
+				views, resolveErr := registry.PolicyProjection(ctx, scope, inputs)
+				for _, view := range views {
+					inputs.Session.Tools = append(inputs.Session.Tools, view.Descriptor.ID)
+				}
+				inputs.Session.Enforced = true
+				return inputs, resolveErr
+			})
+			registry, err = tools.NewRegistry(tools.WithProviders(provider),
+				tools.WithPolicyInputResolver(resolver, tools.ToolsetCatalog{}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -942,6 +1250,13 @@ func TestHostedServiceProjectionGenerationCache(t *testing.T) {
 							return
 						}
 						response.Tools[0].Descriptor.InputSchema[0] = '!'
+						snapshot, err := service.StreamSnapshot(t.Context(), binds[i].BindID, peers[i])
+						if err != nil || snapshot.Digest != response.Digest || len(snapshot.Tools) != 1 ||
+							!json.Valid(snapshot.Tools[0].Descriptor.InputSchema) {
+							t.Errorf("peer %d stream snapshot lost cached catalog: %#v, %v", i, snapshot, err)
+							return
+						}
+						snapshot.Tools[0].Descriptor.InputSchema[0] = '!'
 						unchanged, err := service.StreamProjection(
 							t.Context(),
 							binds[i].BindID,
@@ -960,7 +1275,7 @@ func TestHostedServiceProjectionGenerationCache(t *testing.T) {
 					t.Fatalf("cached peer response = %#v, error = %v", cached, err)
 				}
 				if got := provider.calls.Load() - baseline; got != int64(change+1) {
-					t.Fatalf("projection builds = %d, want %d independent of stream count", got, change+1)
+					t.Fatalf("provider listings = %d, want %d independent of stream count", got, change+1)
 				}
 			}
 			current = current.Add(service.StreamRefreshInterval())
@@ -969,7 +1284,7 @@ func TestHostedServiceProjectionGenerationCache(t *testing.T) {
 				t.Fatalf("refresh = %#v, %v", fresh, err)
 			}
 			if got := provider.calls.Load() - baseline; got != 4 {
-				t.Fatalf("refresh builds = %d, want 4", got)
+				t.Fatalf("refresh listings = %d, want 4", got)
 			}
 			wrongPeer := peers[0]
 			wrongPeer.PID += streams + 1
@@ -1116,6 +1431,61 @@ func TestHostedServiceProjectionGenerationCache(t *testing.T) {
 				response.Tools[0].Descriptor.Description != scope.profile+"/"+scope.workspace {
 				t.Fatalf("scoped projection = %#v, error = %v", response, err)
 			}
+		}
+	})
+
+	t.Run("Should discover each provider scope once per refresh window across peer policies", func(t *testing.T) {
+		t.Parallel()
+		// Invariant: stream rebuilds of peers in one provider scope list that provider once per
+		// epoch and refresh window, while each peer keeps its own policy filtering.
+		f := newHostedListingShareFixture(t)
+		wake := func(description string) {
+			t.Helper()
+			f.wake(t, f.full, description)
+			f.wake(t, f.restricted, description)
+			f.wake(t, f.other, description)
+		}
+		wake("revision 0")
+		if calls := f.listings(); calls != 2 {
+			t.Fatalf("first wake listed %d times, want one per provider scope", calls)
+		}
+		f.revision.Store(1)
+		f.advance(f.service.StreamRefreshInterval() / 2)
+		wake("revision 0")
+		if calls := f.listings(); calls != 2 {
+			t.Fatalf("wakes inside the refresh window listed %d times, want 2", calls)
+		}
+		f.advance(f.service.StreamRefreshInterval())
+		wake("revision 1")
+		if calls := f.listings(); calls != 4 {
+			t.Fatalf("wakes after the refresh window listed %d times, want 4", calls)
+		}
+		f.revision.Store(2)
+		f.epoch.Advance()
+		wake("revision 2")
+		if calls := f.listings(); calls != 6 {
+			t.Fatalf("wakes after an epoch advance listed %d times, want 6", calls)
+		}
+	})
+
+	t.Run("Should expire a projection built late in a listing window with that window", func(t *testing.T) {
+		t.Parallel()
+		// Invariant: a projection built from a shared listing is never served past the listing's
+		// refresh window, so upstream changes without an epoch advance surface within one window.
+		f := newHostedListingShareFixture(t)
+		refresh := f.service.StreamRefreshInterval()
+		f.wake(t, f.full, "revision 0")
+		f.advance(refresh * 5 / 6)
+		f.wake(t, f.restricted, "revision 0")
+		if calls := f.listings(); calls != 1 {
+			t.Fatalf("late build listed %d times, want it to reuse the window's listing", calls)
+		}
+		f.revision.Store(1)
+		f.advance(refresh / 3)
+		f.wake(t, f.restricted, "revision 1")
+		f.wake(t, f.full, "revision 1")
+		if calls := f.listings(); calls != 2 {
+			t.Fatalf("wakes after the listing window listed %d times, want one rotation", calls)
 		}
 	})
 
@@ -1676,6 +2046,11 @@ func TestHostedServiceProjectionGenerationCache(t *testing.T) {
 			response, err := service.StreamProjection(t.Context(), bind.BindID, peer, "")
 			if err != nil {
 				t.Fatalf("StreamProjection(%s) error = %v", label, err)
+			}
+			snapshot, err := service.StreamSnapshot(t.Context(), bind.BindID, peer)
+			if err != nil || snapshot.Digest != response.Digest ||
+				!slices.Equal(hostedToolIDs(snapshot.Tools), hostedToolIDs(response.Tools)) {
+				t.Fatalf("StreamSnapshot(%s) diverged from stream: %#v, %v", label, snapshot, err)
 			}
 			return response
 		}
@@ -2612,6 +2987,93 @@ func (r *hostedRegistryStub) lastCall(t *testing.T) (tools.Scope, tools.CallRequ
 	return r.scopes[len(r.scopes)-1], r.calls[len(r.calls)-1]
 }
 
+// hostedListingShareFixture binds two policy classes in one workspace and one peer in another,
+// over a counting provider whose descriptions report the current upstream revision.
+type hostedListingShareFixture struct {
+	service                 *HostedService
+	provider                *hostedCountingProvider
+	epoch                   *ProjectionEpoch
+	revision                atomic.Int64
+	clock                   atomic.Int64
+	peer                    PeerInfo
+	full, restricted, other string
+	bound                   int64
+}
+
+func newHostedListingShareFixture(t *testing.T) *hostedListingShareFixture {
+	t.Helper()
+	executable := hostedTestExecutable(t, "compozy")
+	native, err := tools.NewNativeProvider(tools.BuiltinSource(),
+		hostedRuntimeNativeTool("compozy__alpha", tools.RiskRead, true),
+		hostedRuntimeNativeTool("compozy__beta", tools.RiskRead, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &hostedListingShareFixture{epoch: NewProjectionEpoch(), peer: hostedTestPeer(executable)}
+	f.provider = &hostedCountingProvider{
+		Provider: native,
+		decorate: func(views []tools.Descriptor, _ tools.Scope) {
+			views[0].Description = fmt.Sprint("revision ", f.revision.Load())
+		},
+	}
+	resolver := hostedPolicyResolver(func(_ context.Context, scope tools.Scope) (tools.PolicyInputs, error) {
+		inputs := tools.DefaultPolicyInputs()
+		if scope.SessionID == "sess-restricted" {
+			inputs.Session = tools.SessionToolPolicy{Enforced: true, Tools: []tools.ToolID{"compozy__alpha"}}
+		}
+		return inputs, nil
+	})
+	registry, err := tools.NewRegistry(tools.WithProviders(f.provider),
+		tools.WithPolicyInputResolver(resolver, tools.ToolsetCatalog{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.service = newHostedTestServiceWithProjectionGeneration(t, executable, registry, nil)
+	f.service.projectionEpoch = f.epoch.Current
+	f.service.now = func() time.Time { return time.Unix(0, f.clock.Load()) }
+	f.full = f.bind(t, "sess-full", "ws-shared")
+	f.restricted = f.bind(t, "sess-restricted", "ws-shared")
+	f.other = f.bind(t, "sess-other", "ws-other")
+	f.bound = f.provider.calls.Load()
+	return f
+}
+
+func (f *hostedListingShareFixture) bind(t *testing.T, sessionID string, workspaceID string) string {
+	t.Helper()
+	launch, err := f.service.Launch(t.Context(), HostedLaunchRequest{SessionID: sessionID, WorkspaceID: workspaceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.ArmLaunch(t.Context(), sessionID); err != nil {
+		t.Fatal(err)
+	}
+	bind, err := f.service.Bind(t.Context(),
+		HostedBindRequest{SessionID: sessionID, Nonce: hostedLaunchNonce(t, launch.Args)}, f.peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bind.BindID
+}
+
+// wake reads one stream projection and checks the peer's policy filtering and listed revision.
+func (f *hostedListingShareFixture) wake(t *testing.T, bindID string, description string) {
+	t.Helper()
+	want := []string{"compozy__alpha", "compozy__beta"}
+	if bindID == f.restricted {
+		want = want[:1]
+	}
+	response, err := f.service.StreamProjection(t.Context(), bindID, f.peer, "")
+	if err != nil || !slices.Equal(hostedToolIDs(response.Tools), want) ||
+		response.Tools[0].Descriptor.Description != description {
+		t.Fatalf("projection = %#v, error = %v, want %v with %q", response, err, want, description)
+	}
+}
+
+func (f *hostedListingShareFixture) advance(d time.Duration) { f.clock.Add(int64(d)) }
+
+// listings counts provider listings made by stream wakes, excluding bind-time bootstrap.
+func (f *hostedListingShareFixture) listings() int64 { return f.provider.calls.Load() - f.bound }
+
 type hostedCountingProvider struct {
 	tools.Provider
 	calls      atomic.Int64
@@ -2641,4 +3103,63 @@ type hostedPolicyResolver func(context.Context, tools.Scope) (tools.PolicyInputs
 
 func (r hostedPolicyResolver) Resolve(ctx context.Context, scope tools.Scope) (tools.PolicyInputs, error) {
 	return r(ctx, scope)
+}
+
+type hostedDeferredProvider struct{ *tools.NativeProvider }
+
+func (hostedDeferredProvider) DeferInitialDiscovery() bool { return true }
+
+// Invariant: external tool identity and schemas determine the digest; order, health and native tools do not.
+// Owner: advertised catalog; canonical suite: hosted catalog tests (UT-026/UT-027/UT-028).
+func TestHostedAdvertisedCatalogDigest(t *testing.T) {
+	t.Parallel()
+	t.Run("Should normalize fifty sources and include extension schemas", func(t *testing.T) {
+		t.Parallel()
+		views := make([]tools.ToolView, 0, 51)
+		for i := range 50 {
+			view := hostedToolView(tools.ToolID(fmt.Sprintf("mcp__server%d__echo", i)))
+			view.Descriptor.Source = tools.SourceRef{
+				Kind:          tools.SourceMCP,
+				Owner:         fmt.Sprintf("server%d", i),
+				RawServerName: fmt.Sprintf("server%d", i),
+				RawToolName:   "echo",
+			}
+			views = append(views, view)
+		}
+		bound := hostedExternalToolDigest(views)
+		views[0].Descriptor.Source.ResourceVersion = "rediscovered-revision"
+		views[0].Availability = tools.Unavailable(tools.ReasonBackendUnhealthy)
+		if hostedExternalToolDigest(views) != bound {
+			t.Fatal("discovery revision or health changed the advertised views")
+		}
+		slices.Reverse(views)
+		if hostedExternalToolDigest(views) != bound {
+			t.Fatal("source ordering changed digest")
+		}
+		views = append(views, hostedToolView("compozy__tool_list"))
+		if hostedExternalToolDigest(views) != bound {
+			t.Fatal("native tool changed digest")
+		}
+		dynamic := hostedToolView("dynamic__ignored")
+		dynamic.Descriptor.Source = tools.SourceRef{Kind: tools.SourceDynamic, Owner: "runtime"}
+		views = append(views, dynamic)
+		if hostedExternalToolDigest(views) != bound {
+			t.Fatal("dynamic tool changed digest")
+		}
+		ext := hostedToolView("ext__notes__ping")
+		ext.Descriptor.Source = tools.SourceRef{Kind: tools.SourceExtension, Owner: "notes"}
+		views = append(views, ext)
+		withExtension := hostedExternalToolDigest(views)
+		if withExtension == bound {
+			t.Fatal("extension omitted from digest")
+		}
+		views[len(views)-1].Descriptor.InputSchemaDigest = "changed-schema"
+		if hostedExternalToolDigest(views) == withExtension {
+			t.Fatal("schema omitted from digest")
+		}
+		views = views[:len(views)-1]
+		if hostedExternalToolDigest(views) != bound {
+			t.Fatal("enable then disable did not restore bound catalog")
+		}
+	})
 }

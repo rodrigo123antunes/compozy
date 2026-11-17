@@ -3,27 +3,64 @@ package settings
 import (
 	"context"
 	"fmt"
+	"strings"
+
+	mcpauth "github.com/compozy/compozy/internal/mcp/auth"
 )
 
 func (s *service) populateMCPServerStatuses(
 	ctx context.Context,
 	item *MCPServerItem,
 	entry mcpSourceEntry,
+	skipRuntimeStatus, cachedRuntimeStatus bool,
 ) error {
+	ctx = mcpauth.WithConsentScope(
+		ctx,
+		mcpauth.ConsentScope{ProfileName: item.ProfileName, WorkspaceID: item.WorkspaceID},
+	)
 	target, err := mcpAuthTargetForSource(entry)
 	if err != nil {
 		return err
 	}
+	if s.mcpConsent != nil {
+		req := consentRequestForTarget(target, entry.Server)
+		// The listing profile owns consent even when credentials are inherited.
+		req.ProfileName = item.ProfileName
+		req.WorkspaceID = item.WorkspaceID
+		decision, consentErr := s.mcpConsent.MCPConsent(ctx, req)
+		if consentErr != nil {
+			return consentErr
+		}
+		required := (target.Scope == mcpauth.ScopeWorkspace || target.Scope == mcpauth.ScopeWorkspaceProfile) &&
+			!strings.HasPrefix(target.Owner, "extension:")
+		item.Approval = approvalState(decision, required)
+		item.CallableInSessions = decision.Admitted
+		skipRuntimeStatus = skipRuntimeStatus || !decision.Admitted
+	}
 	name := entry.Server.Name
-	if s.mcpAuth != nil && !entry.Server.Auth.IsZero() {
+	if s.mcpAuth != nil && mcpauth.OAuthCapable(entry.Server) && entry.Server.Validate("mcp_server") == nil {
 		status, statusErr := s.mcpAuth.MCPAuthStatus(ctx, target, entry.Server)
 		if statusErr != nil {
 			return fmt.Errorf("settings: load MCP auth status for %q: %w", name, statusErr)
 		}
 		item.AuthStatus = &status
 	}
-	if s.mcpRuntime != nil {
-		status, statusErr := s.mcpRuntime.MCPServerRuntimeStatus(ctx, target, entry.Server)
+	if s.mcpRuntime != nil && !skipRuntimeStatus {
+		var status MCPServerRuntimeStatus
+		var statusErr error
+		if cachedRuntimeStatus {
+			status = MCPServerRuntimeStatus{
+				Configured: true,
+				State:      MCPServerRuntimeStateUnknown,
+				Probe:      MCPServerProbeSkipped,
+				Reason:     "not_observed",
+			}
+			if reader, ok := s.mcpRuntime.(MCPCachedRuntimeProvider); ok {
+				status, statusErr = reader.MCPServerCachedRuntimeStatus(ctx, target, entry.Server)
+			}
+		} else {
+			status, statusErr = s.mcpRuntime.MCPServerRuntimeStatus(ctx, target, entry.Server)
+		}
 		if statusErr != nil {
 			return fmt.Errorf("settings: load MCP runtime status for %q: %w", name, statusErr)
 		}

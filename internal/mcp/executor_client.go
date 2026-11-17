@@ -13,6 +13,7 @@ import (
 
 	compozyconfig "github.com/compozy/compozy/internal/config"
 	"github.com/compozy/compozy/internal/mcp/securehttp"
+	"github.com/compozy/compozy/internal/mcppolicy"
 	toolspkg "github.com/compozy/compozy/internal/tools"
 	"github.com/compozy/compozy/internal/vault"
 	"github.com/compozy/compozy/internal/version"
@@ -31,10 +32,28 @@ const maxAuthorizationChallengeDrainBytes = int64(64 << 10)
 
 func (e *CallExecutor) openClient(
 	ctx context.Context,
-	resolved ResolvedServer,
+	resolved *ResolvedServer,
 	authorizationHeader string,
 ) (*managedMCPClient, error) {
 	server := resolved.Server
+	if server.EffectiveTransport() == compozyconfig.MCPServerTransportHTTP {
+		rendered, secrets, err := server.RenderInputs(
+			func(ref string) (string, error) { return e.resolveSecretRef(ctx, ref) },
+		)
+		if err != nil {
+			return nil, err
+		}
+		if err := mcppolicy.ValidateRemoteURL(rendered.URL); err != nil {
+			return nil, errors.New("mcp: invalid rendered endpoint")
+		}
+		for _, secret := range secrets {
+			registerMCPRequestSecret(ctx, secret)
+		}
+		server = rendered
+		renderedResolved := *resolved
+		renderedResolved.Server = server
+		resolved = &renderedResolved
+	}
 	transport := server.EffectiveTransport()
 	switch transport {
 	case compozyconfig.MCPServerTransportStdio:
@@ -103,7 +122,7 @@ func connectMCPClient(ctx context.Context, transport mcpsdk.Transport) (*mcpsdk.
 	return session, nil
 }
 
-func (e *CallExecutor) openPooledStdioClient(ctx context.Context, resolved ResolvedServer) (*managedMCPClient, error) {
+func (e *CallExecutor) openPooledStdioClient(ctx context.Context, resolved *ResolvedServer) (*managedMCPClient, error) {
 	spec, err := e.mcpStdioSpec(ctx, resolved.Server, resolved.Target)
 	if err != nil {
 		return nil, err
@@ -147,7 +166,7 @@ func releaseMCPClient(client *managedMCPClient, callErr error) error {
 
 func (e *CallExecutor) httpClientWithAuthorization(
 	ctx context.Context,
-	resolved ResolvedServer,
+	resolved *ResolvedServer,
 	authorizationHeader string,
 ) (*http.Client, error) {
 	client := e.httpClientForServer(resolved)
@@ -159,7 +178,11 @@ func (e *CallExecutor) httpClientWithAuthorization(
 	if err != nil {
 		return nil, err
 	}
-	configureMCPRedirectPolicy(client, resolved.Server.Auth.Enabled(), authorizationHeader != "" || len(headers) > 0)
+	configureMCPRedirectPolicy(
+		client,
+		resolved.Server.Auth.Enabled() || authorizationHeader != "",
+		authorizationHeader != "" || len(headers) > 0,
+	)
 	client.Transport = authorizationRoundTripper{
 		next: transport, header: authorizationHeader, headers: headers,
 	}
@@ -216,7 +239,7 @@ func (e *CallExecutor) resolveMCPRequestHeaders(
 	return headers, nil
 }
 
-func (e *CallExecutor) httpClientForServer(resolved ResolvedServer) *http.Client {
+func (e *CallExecutor) httpClientForServer(resolved *ResolvedServer) *http.Client {
 	if strings.TrimSpace(resolved.Server.CatalogEntry) != "" {
 		return securehttp.NewClient(securehttp.WithTimeout(e.timeout)).HTTPClient()
 	}

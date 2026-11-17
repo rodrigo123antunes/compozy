@@ -25,6 +25,7 @@ import (
 	compozyconfig "github.com/compozy/compozy/internal/config"
 	"github.com/compozy/compozy/internal/diagnostics"
 	mcpauth "github.com/compozy/compozy/internal/mcp/auth"
+	"github.com/compozy/compozy/internal/mcp/securehttp"
 	"github.com/compozy/compozy/internal/testutil/mcpfixture"
 	toolspkg "github.com/compozy/compozy/internal/tools"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -46,6 +47,66 @@ func (e *testMCPSecretError) Error() string {
 }
 
 func TestMCPCallExecutor(t *testing.T) {
+	// Invariant: consent and transport use one immutable definition; owner: executor I/O boundary.
+	for _, operation := range []string{"list", "call"} {
+		t.Run(
+			"Should launch the consented definition when configuration changes during "+operation,
+			func(t *testing.T) {
+				t.Parallel()
+				approved := newTestMCPHTTPServer(newFakeSDKServer(nil))
+				t.Cleanup(approved.Close)
+				var unexpected atomic.Int32
+				replacement := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					unexpected.Add(1)
+					w.WriteHeader(http.StatusForbidden)
+				}))
+				t.Cleanup(replacement.Close)
+				current := compozyconfig.MCPServer{Name: "fixture", Transport: "http", URL: approved.URL}
+				resolutions, checks := 0, 0
+				executor, err := NewMCPCallExecutor(
+					ServerResolverFunc(func(context.Context, toolspkg.SourceRef, string) (ResolvedServer, error) {
+						resolutions++
+						return ResolvedServer{Server: current, Target: userMCPExecutorTarget("fixture")}, nil
+					}),
+					WithDefinitionDigestKey([]byte("test installation key")),
+					WithConsentCheck(func(_ context.Context, _ toolspkg.SourceRef, resolved ResolvedServer) error {
+						checks++
+						if resolved.Server.URL != approved.URL {
+							return errors.New("definition was not approved")
+						}
+						current.URL = replacement.URL
+						return nil
+					}),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				source := toolspkg.SourceRef{Kind: toolspkg.SourceMCP, Owner: "fixture", RawServerName: "fixture"}
+				if operation == "list" {
+					_, err = executor.ListTools(t.Context(), source)
+				} else {
+					_, err = executor.CallTool(
+						t.Context(),
+						source,
+						toolspkg.MCPToolCallRequest{
+							ToolID:      "mcp__fixture__echo",
+							RawToolName: "echo",
+							Input:       json.RawMessage(`{"message":"approved"}`),
+						},
+					)
+				}
+				if err != nil || resolutions != 1 || checks != 1 || unexpected.Load() != 0 {
+					t.Fatalf(
+						"err=%v resolutions=%d checks=%d unexpected=%d",
+						err,
+						resolutions,
+						checks,
+						unexpected.Load(),
+					)
+				}
+			},
+		)
+	}
 	t.Run("Should negotiate modern protocol and paginate tools", func(t *testing.T) {
 		t.Parallel()
 
@@ -429,6 +490,140 @@ func TestMCPCallExecutor(t *testing.T) {
 		assertJSONDoesNotContain(t, "result", result, "secret-access", "secret-refresh")
 	})
 
+	t.Run("Should sign in and use a bare remote without changing its definition", func(t *testing.T) {
+		t.Parallel()
+		fixture := mcpfixture.StartOAuthHTTP(
+			t,
+			mcpfixture.MustNew(mcpfixture.ProfileModern2026),
+			mcpfixture.OAuthConfig{},
+		)
+		server := compozyconfig.MCPServer{Name: "fixture", Transport: "http", URL: fixture.Endpoints.MCPURL}
+		target := userMCPExecutorTarget(server.Name)
+		store := newMemoryTokenStore()
+		service, err := mcpauth.NewService(store, mcpauth.WithRegistrationStore(store),
+			mcpauth.WithSecureHTTPClient(securehttp.NewClient(securehttp.WithAllowLoopback(true))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := mcpauth.ServerConfigFromMCP(t.Context(), target, server, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := service.Status(t.Context(), cfg)
+		if err != nil || before.Status != mcpauth.StatusUnconfigured {
+			t.Fatalf("before = %#v, %v", before, err)
+		}
+		login, err := service.BeginLogin(t.Context(), cfg, "http://127.0.0.1:2123/api/mcp/oauth/callback")
+		if err != nil {
+			t.Fatal(err)
+		}
+		status, err := service.Exchange(
+			t.Context(),
+			&login,
+			login.RedirectURL+"?state="+url.QueryEscape(login.State)+"&code="+mcpfixture.AuthorizationCode,
+		)
+		if err != nil || status.Status != mcpauth.StatusAuthenticated {
+			t.Fatalf("exchange = %#v, %v", status, err)
+		}
+		executor := newTestMCPExecutor(t, server, WithTokenStore(store),
+			WithSecretResolver(secretRefResolverFunc(func(context.Context, string) (string, error) {
+				return login.Config.ClientSecret, nil
+			})))
+		tools, err := executor.ListTools(
+			t.Context(),
+			toolspkg.SourceRef{Kind: toolspkg.SourceMCP, Owner: server.Name, RawServerName: server.Name},
+		)
+		if err != nil || len(tools) == 0 {
+			t.Fatalf("tools after sign in = %d, %v", len(tools), err)
+		}
+		token, err := store.GetMCPAuthToken(t.Context(), target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		token.ExpiresAt = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+		if err := store.SaveMCPAuthToken(t.Context(), token); err != nil {
+			t.Fatal(err)
+		}
+		source := toolspkg.SourceRef{Kind: toolspkg.SourceMCP, Owner: server.Name, RawServerName: server.Name}
+		statusView, err := executor.Status(t.Context(), source, "")
+		if err != nil || statusView.Status != "expired" || !statusView.Refreshable {
+			t.Fatalf("expired status = %+v, %v", statusView, err)
+		}
+		if reason, denied := toolspkg.MCPAuthStatusReason(statusView); denied {
+			t.Fatalf("refreshable tool gated before call: %s", reason)
+		}
+		beforeRefresh := len(fixture.Requests().Token)
+		result, err := executor.CallTool(t.Context(), source, toolspkg.MCPToolCallRequest{
+			ToolID: "mcp__fixture__echo", RawToolName: "echo", Input: json.RawMessage(`{"message":"renewed-call"}`),
+		})
+		if err != nil || !strings.Contains(result.Preview, "renewed-call") {
+			t.Fatalf("call across expiry = %+v, %v", result, err)
+		}
+		refreshes := fixture.Requests().Token
+		if len(refreshes) != beforeRefresh+1 || refreshes[beforeRefresh].Get("grant_type") != "refresh_token" {
+			t.Fatal("expired call did not refresh exactly once")
+		}
+		server.Auth = compozyconfig.MCPAuthConfig{Registration: "auto"}
+		server.Headers = map[string]string{"X-API-Version": "1"}
+		beforeHeaders := len(fixture.Requests().MCPHeaders)
+		explicit := newTestMCPExecutor(t, server, WithTokenStore(store))
+		if tools, err := explicit.ListTools(
+			t.Context(),
+			toolspkg.SourceRef{Kind: toolspkg.SourceMCP, Owner: server.Name, RawServerName: server.Name},
+		); err != nil ||
+			len(tools) == 0 {
+			t.Fatalf("explicit OAuth with auxiliary headers lost its credential: %v", err)
+		}
+		received := fixture.Requests().MCPHeaders
+		if len(received) <= beforeHeaders {
+			t.Fatal("explicit OAuth did not send an MCP request")
+		}
+		for _, headers := range received[beforeHeaders:] {
+			if headers.Get("X-API-Version") != "1" {
+				t.Fatal("explicit OAuth dropped its auxiliary header")
+			}
+		}
+	})
+
+	t.Run("Should probe a bare remote without credentials when the token store fails", func(t *testing.T) {
+		t.Parallel()
+		fixture := mcpfixture.MustNew(mcpfixture.ProfileModern2026)
+		handler := fixture.StreamableHTTPHandler()
+		var requests atomic.Int32
+		remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			if r.Header.Get("Authorization") != "" {
+				t.Error("unavailable token store sent an authorization header")
+			}
+			handler.ServeHTTP(w, r)
+		}))
+		defer remote.Close()
+		server := compozyconfig.MCPServer{Name: "open", Transport: "http", URL: remote.URL}
+		store := newMemoryTokenStore()
+		store.getErr = errors.New("token store unavailable")
+		executor := newTestMCPExecutor(t, server, WithTokenStore(store))
+		source := toolspkg.SourceRef{Kind: toolspkg.SourceMCP, Owner: server.Name, RawServerName: server.Name}
+		if tools, err := executor.ListTools(t.Context(), source); err != nil || len(tools) == 0 {
+			t.Fatalf("bare remote tools = %d, %v", len(tools), err)
+		}
+		before := requests.Load()
+		if before == 0 {
+			t.Fatal("bare remote did not reach the MCP endpoint")
+		}
+		server.Auth = compozyconfig.MCPAuthConfig{Registration: "auto"}
+		explicit := newTestMCPExecutor(t, server, WithTokenStore(store))
+		if _, err := explicit.ListTools(
+			t.Context(),
+			source,
+		); err == nil ||
+			!strings.Contains(err.Error(), "token store unavailable") {
+			t.Fatalf("explicit OAuth lost its storage error: %v", err)
+		}
+		if requests.Load() != before {
+			t.Fatal("explicit OAuth bypassed unavailable storage")
+		}
+	})
+
 	t.Run("Should resolve a persisted DCR client secret through the executor auth service", func(t *testing.T) {
 		t.Parallel()
 
@@ -480,6 +675,7 @@ func TestMCPCallExecutor(t *testing.T) {
 			ServerResolverFunc(func(context.Context, toolspkg.SourceRef, string) (ResolvedServer, error) {
 				return ResolvedServer{Server: server, Target: target}, nil
 			}),
+			WithDefinitionDigestKey([]byte("test installation key")),
 			WithTokenStore(store),
 			WithHTTPClient(oauthFixture.Server.Client()),
 			WithSecretResolver(secretRefResolverFunc(func(_ context.Context, ref string) (string, error) {
@@ -546,7 +742,7 @@ func TestMCPCallExecutor(t *testing.T) {
 		}
 		executor := newTestMCPExecutor(t, replacement, WithTokenStore(store))
 		resolved := ResolvedServer{Server: replacement, Target: target}
-		if got := executor.authorizationHeader(t.Context(), resolved); got != "" {
+		if got := executor.authorizationHeader(t.Context(), &resolved); got != "" {
 			t.Fatalf("authorizationHeader(replacement) = %q, want empty", got)
 		}
 		_, err := executor.ListTools(t.Context(), toolspkg.SourceRef{
@@ -622,7 +818,8 @@ func TestMCPCallExecutor(t *testing.T) {
 				return ResolvedServer{}, errors.New("unexpected MCP resource")
 			}
 		})
-		executor, err := NewMCPCallExecutor(resolver, WithTokenStore(store))
+		executor, err := NewMCPCallExecutor(resolver,
+			WithDefinitionDigestKey([]byte("test installation key")), WithTokenStore(store))
 		if err != nil {
 			t.Fatalf("NewMCPCallExecutor() error = %v", err)
 		}
@@ -1067,6 +1264,11 @@ func TestMCPRequestSecretLifecycle(t *testing.T) {
 			t.Fatalf("tools/list calls = %d, want %d after provider projection", got, want)
 		}
 
+		fresh, err := executor.ListTools(toolspkg.WithFreshMCPDiscovery(t.Context()), source)
+		if err != nil || len(fresh) != 1 || listCalls.Load() != 2 {
+			t.Fatalf("fresh probe: %v, %v, calls=%d", fresh, err, listCalls.Load())
+		}
+
 		result, err := executor.CallTool(t.Context(), source, toolspkg.MCPToolCallRequest{
 			ToolID:      descriptors[0].ID,
 			RawToolName: descriptors[0].RawName,
@@ -1351,6 +1553,152 @@ func TestMCPClientCleanup(t *testing.T) {
 // Owning layer: internal/mcp unit cache.
 // Canonical suite: internal/mcp/executor_test.go.
 func TestMCPToolListCache(t *testing.T) {
+	for _, checkFirst := range []bool{false, true} {
+		t.Run(
+			fmt.Sprintf("Should preserve fresh cache and projection when checkFirst=%v", checkFirst),
+			func(t *testing.T) {
+				t.Parallel()
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				started, release := make(chan struct{}), make(chan struct{})
+				unblock := sync.OnceFunc(func() { close(release) })
+				var calls atomic.Int32
+				sdkServer := newFakeSDKServer(nil)
+				sdkServer.AddReceivingMiddleware(func(next mcpsdk.MethodHandler) mcpsdk.MethodHandler {
+					return func(ctx context.Context, method string, request mcpsdk.Request) (mcpsdk.Result, error) {
+						if method != mcpToolsListMethod {
+							return next(ctx, method, request)
+						}
+						first := calls.Add(1) == 1
+						if first {
+							close(started)
+							select {
+							case <-release:
+							case <-ctx.Done():
+								return nil, ctx.Err()
+							}
+						}
+						name := "old"
+						if first == checkFirst {
+							name = "fresh"
+						}
+						return &mcpsdk.ListToolsResult{
+							Tools: []*mcpsdk.Tool{{Name: name, InputSchema: map[string]any{"type": "object"}}},
+							TTLMs: 60_000,
+						}, nil
+					}
+				})
+				server := newTestMCPHTTPServer(sdkServer)
+				t.Cleanup(server.Close)
+				configured := compozyconfig.MCPServer{
+					Name:      "fixture",
+					Transport: compozyconfig.MCPServerTransportHTTP,
+					URL:       server.URL,
+				}
+				executor := newTestMCPExecutor(t, configured)
+				source := toolspkg.SourceRef{Kind: toolspkg.SourceMCP, Owner: "fixture", RawServerName: "fixture"}
+				done, joined := make(chan error, 1), make(chan struct{})
+				t.Cleanup(func() {
+					unblock()
+					cancel()
+					select {
+					case <-joined:
+					case <-time.After(5 * time.Second):
+						t.Error("listing did not exit")
+					}
+				})
+				firstCtx, secondCtx := ctx, toolspkg.WithFreshMCPDiscovery(ctx)
+				if checkFirst {
+					firstCtx, secondCtx = secondCtx, firstCtx
+				}
+				go func() { defer close(joined); _, err := executor.ListTools(firstCtx, source); done <- err }()
+				select {
+				case <-started:
+				case err := <-done:
+					t.Fatalf("listing exited before request: %v", err)
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				if _, err := executor.ListTools(secondCtx, source); err != nil {
+					t.Fatal(err)
+				}
+				generation, authoritative := executor.ProjectionGeneration(ctx, []toolspkg.SourceRef{source})
+				if !authoritative {
+					t.Fatal("missing projection")
+				}
+				unblock()
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				cached, err := executor.ListTools(ctx, source)
+				if err != nil || len(cached) != 1 || cached[0].RawName != "fresh" {
+					t.Fatalf("cache=%+v err=%v", cached, err)
+				}
+				finalGeneration, authoritative := executor.ProjectionGeneration(ctx, []toolspkg.SourceRef{source})
+				if !authoritative || (!checkFirst && finalGeneration != generation) ||
+					(checkFirst && finalGeneration == generation) {
+					t.Fatalf(
+						"projection before=%q after=%q authoritative=%v",
+						generation,
+						finalGeneration,
+						authoritative,
+					)
+				}
+				if calls.Load() != 2 {
+					t.Fatalf("list calls=%d, want cache hit after two discoveries", calls.Load())
+				}
+			},
+		)
+	}
+
+	t.Run("Should drop the cached list when a fresh check answers without a TTL", func(t *testing.T) {
+		t.Parallel()
+		var calls atomic.Int32
+		sdkServer := newFakeSDKServer(nil)
+		sdkServer.AddReceivingMiddleware(func(next mcpsdk.MethodHandler) mcpsdk.MethodHandler {
+			return func(ctx context.Context, method string, request mcpsdk.Request) (mcpsdk.Result, error) {
+				if method != mcpToolsListMethod {
+					return next(ctx, method, request)
+				}
+				// The first listing is cacheable; every later answer is fresh and uncacheable.
+				if calls.Add(1) == 1 {
+					return &mcpsdk.ListToolsResult{
+						Tools: []*mcpsdk.Tool{{Name: "old", InputSchema: map[string]any{"type": "object"}}},
+						TTLMs: 60_000,
+					}, nil
+				}
+				return &mcpsdk.ListToolsResult{
+					Tools: []*mcpsdk.Tool{{Name: "fresh", InputSchema: map[string]any{"type": "object"}}},
+				}, nil
+			}
+		})
+		server := newTestMCPHTTPServer(sdkServer)
+		t.Cleanup(server.Close)
+		executor := newTestMCPExecutor(t, compozyconfig.MCPServer{
+			Name:      "fixture",
+			Transport: compozyconfig.MCPServerTransportHTTP,
+			URL:       server.URL,
+		})
+		source := toolspkg.SourceRef{Kind: toolspkg.SourceMCP, Owner: "fixture", RawServerName: "fixture"}
+		ctx := t.Context()
+
+		if _, err := executor.ListTools(ctx, source); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := executor.ListTools(toolspkg.WithFreshMCPDiscovery(ctx), source); err != nil {
+			t.Fatal(err)
+		}
+		listed, err := executor.ListTools(ctx, source)
+		if err != nil || len(listed) != 1 || listed[0].RawName != "fresh" {
+			t.Fatalf("listed=%+v err=%v, want the fresh check's tools", listed, err)
+		}
+	})
+
 	t.Run("Should isolate cached descriptor schemas from caller mutation", func(t *testing.T) {
 		t.Parallel()
 
@@ -2033,6 +2381,40 @@ func TestCallExecutorDescriptorFromToolPreservesPresentationMetadata(t *testing.
 	})
 }
 
+func TestMCPStdioServerEnvPassesCATrustBundles(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should pass every set CA trust bundle and let the server definition override it", func(t *testing.T) {
+		t.Parallel()
+
+		daemon := map[string]string{
+			"NODE_EXTRA_CA_CERTS": "/etc/ssl/certs/ca-certificates.crt",
+			"REQUESTS_CA_BUNDLE":  "/etc/ssl/certs/ca-certificates.crt",
+			"SSL_CERT_DIR":        "/etc/ssl/certs",
+			"SSL_CERT_FILE":       "/etc/ssl/daemon-ca.crt",
+			"UNLISTED_SETTING":    "value",
+		}
+		lookup := func(key string) (string, bool) {
+			value, ok := daemon[key]
+			return value, ok
+		}
+		env := mcpServerEnvWith(map[string]string{"SSL_CERT_FILE": "/server/ca.crt"}, lookup)
+		for _, want := range []string{
+			"NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+			"REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+			"SSL_CERT_DIR=/etc/ssl/certs",
+			"SSL_CERT_FILE=/server/ca.crt",
+		} {
+			if !slices.Contains(env, want) {
+				t.Fatalf("mcpServerEnvWith() = %#v, missing %q", env, want)
+			}
+		}
+		if slices.Contains(env, "UNLISTED_SETTING=value") {
+			t.Fatalf("mcpServerEnvWith() passed a non-allowlisted variable: %#v", env)
+		}
+	})
+}
+
 func TestMCPCallExecutorStdioEnvironmentBoundary(t *testing.T) {
 	t.Run("Should report a PATH-miss launch failure for only the target server", func(t *testing.T) {
 		t.Parallel()
@@ -2052,6 +2434,7 @@ func TestMCPCallExecutorStdioEnvironmentBoundary(t *testing.T) {
 					Server: server, Target: userMCPExecutorTarget(server.Name), HealthKey: healthKey,
 				}, nil
 			}),
+			WithDefinitionDigestKey([]byte("test installation key")),
 			WithRuntimeHealthRegistry(registry),
 		)
 		if err != nil {
@@ -2088,6 +2471,7 @@ func TestMCPCallExecutorStdioEnvironmentBoundary(t *testing.T) {
 					Server: server, Target: userMCPExecutorTarget(server.Name), HealthKey: healthKey,
 				}, nil
 			}),
+			WithDefinitionDigestKey([]byte("test installation key")),
 			WithRuntimeHealthRegistry(registry),
 			WithDataDirCreator(func(string) error { return errors.New("injected data directory failure") }),
 		)
@@ -2136,6 +2520,7 @@ func TestMCPCallExecutorStdioEnvironmentBoundary(t *testing.T) {
 					Server: resolved, Target: userMCPExecutorTarget(resolved.Name), HealthKey: healthKey,
 				}, nil
 			}),
+			WithDefinitionDigestKey([]byte("test installation key")),
 			WithRuntimeHealthRegistry(registry),
 		)
 		if err != nil {
@@ -2183,6 +2568,7 @@ func TestMCPCallExecutorStdioEnvironmentBoundary(t *testing.T) {
 					Server: resolved, Target: userMCPExecutorTarget(resolved.Name), HealthKey: healthKey,
 				}, nil
 			}),
+			WithDefinitionDigestKey([]byte("test installation key")),
 			WithRuntimeHealthRegistry(health),
 		)
 		if err != nil {
@@ -2415,7 +2801,7 @@ func TestMCPCallExecutorStdioEnvironmentBoundary(t *testing.T) {
 			return ""
 		}))
 		resolved := ResolvedServer{Server: server, Target: userMCPExecutorTarget(server.Name)}
-		client, err := executor.openClient(ctx, resolved, "")
+		client, err := executor.openClient(ctx, &resolved, "")
 		if err != nil {
 			t.Fatalf("openClient() error = %v", err)
 		}
@@ -2638,6 +3024,39 @@ func TestMCPStdioHelperProcess(t *testing.T) {
 }
 
 func TestMCPCallExecutorHelpers(t *testing.T) {
+	t.Run("Should reject construction without an installation digest key", func(t *testing.T) {
+		t.Parallel()
+		resolver := ServerResolverFunc(func(context.Context, toolspkg.SourceRef, string) (ResolvedServer, error) {
+			return ResolvedServer{}, nil
+		})
+		if executor, err := NewMCPCallExecutor(resolver); err == nil || executor != nil {
+			t.Fatal("executor accepted a missing digest key")
+		}
+	})
+	t.Run("Should bind auth to the installation digest of the unresolved definition", func(t *testing.T) {
+		t.Parallel()
+		key := []byte("installation auth key")
+		server := compozyconfig.MCPServer{
+			Name: "remote", Transport: "http", URL: "https://example.com/${TENANT}",
+			InputValues: map[string]compozyconfig.MCPInputValue{"TENANT": {Value: "private-tenant"}},
+		}
+		executor := newTestMCPExecutor(t, server, WithDefinitionDigestKey(key))
+		cfg, err := executor.serverAuthConfig(
+			t.Context(),
+			&ResolvedServer{Server: server, Target: userMCPExecutorTarget(server.Name)},
+			nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected, err := compozyconfig.MCPDefinitionDigest(server, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.DefinitionDigest != expected || cfg.RemoteURL != "https://example.com/private-tenant" {
+			t.Fatalf("auth definition identity differs: %+v", cfg)
+		}
+	})
 	t.Run("Should preserve the explicit definition owner through auth diagnostics", func(t *testing.T) {
 		t.Parallel()
 		server := compozyconfig.MCPServer{Name: "github", Owner: "extension:bundle", Command: "test-mcp"}
@@ -2891,7 +3310,7 @@ func TestMCPCallExecutorHelpers(t *testing.T) {
 		}
 		executor := newTestMCPExecutor(t, server, withAuthService(fakeAuth))
 		resolved := ResolvedServer{Server: server, Target: userMCPExecutorTarget("secure")}
-		if err := executor.ensureAuthorized(testContext(t), resolved); err != nil {
+		if err := executor.ensureAuthorized(testContext(t), &resolved); err != nil {
 			t.Fatalf("ensureAuthorized(refresh success) error = %v", err)
 		}
 		if got, want := fakeAuth.refreshCallCount(), 1; got != want {
@@ -2913,7 +3332,7 @@ func TestMCPCallExecutorHelpers(t *testing.T) {
 			},
 		}
 		executor = newTestMCPExecutor(t, server, withAuthService(invalidAuth))
-		err := executor.ensureAuthorized(testContext(t), resolved)
+		err := executor.ensureAuthorized(testContext(t), &resolved)
 		requireReason(t, err, toolspkg.ReasonMCPAuthInvalid)
 	})
 
@@ -2941,12 +3360,12 @@ func TestMCPCallExecutorHelpers(t *testing.T) {
 			Server: compozyconfig.MCPServer{Name: "github"},
 			Target: userMCPExecutorTarget("github"),
 		}
-		if got := executor.authorizationHeader(testContext(t), resolved); got != "" {
+		if got := executor.authorizationHeader(testContext(t), &resolved); got != "" {
 			t.Fatalf("authorizationHeader(non-bearer) = %q, want empty", got)
 		}
 		if got := (&CallExecutor{}).authorizationHeader(
 			testContext(t),
-			resolved,
+			&resolved,
 		); got != "" {
 			t.Fatalf("authorizationHeader(nil store) = %q, want empty", got)
 		}
@@ -3016,11 +3435,11 @@ func TestMCPCallExecutorHelpers(t *testing.T) {
 				}
 				executor := newTestMCPExecutor(t, server, WithTokenStore(store))
 				resolved := ResolvedServer{Server: server, Target: target}
-				if got := executor.authorizationHeader(t.Context(), resolved); got != fixture.want {
+				if got := executor.authorizationHeader(t.Context(), &resolved); got != fixture.want {
 					t.Fatalf("authorizationHeader() = %q, want %q", got, fixture.want)
 				}
 				if fixture.reason != "" {
-					requireReason(t, executor.ensureAuthorized(t.Context(), resolved), fixture.reason)
+					requireReason(t, executor.ensureAuthorized(t.Context(), &resolved), fixture.reason)
 				}
 			})
 		}
@@ -3497,6 +3916,7 @@ func newTestMCPExecutor(
 ) *CallExecutor {
 	t.Helper()
 
+	options = append([]CallExecutorOption{WithDefinitionDigestKey([]byte("test installation key"))}, options...)
 	executor, err := NewMCPCallExecutor(
 		ServerResolverFunc(func(context.Context, toolspkg.SourceRef, string) (ResolvedServer, error) {
 			return ResolvedServer{Server: server, Target: userMCPExecutorTarget(server.Name)}, nil
@@ -3769,6 +4189,7 @@ func (s *fakeAuthService) lastServerConfig() mcpauth.ServerConfig {
 
 type memoryTokenStore struct {
 	mu            sync.Mutex
+	getErr        error
 	tokens        map[string]mcpauth.TokenRecord
 	registrations map[string]mcpauth.ClientRegistration
 }
@@ -3804,6 +4225,9 @@ func (s *memoryTokenStore) GetMCPAuthToken(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.getErr != nil {
+		return mcpauth.TokenRecord{}, s.getErr
+	}
 
 	key, err := target.Key()
 	if err != nil {
@@ -3955,4 +4379,116 @@ func (f secretRefResolverFunc) ResolveRef(ctx context.Context, ref string) (stri
 
 func userMCPExecutorTarget(serverName string) mcpauth.Target {
 	return mcpauth.Target{Scope: mcpauth.ScopeUser, ServerName: serverName}
+}
+
+func TestCheckInReadOnlyOverride(t *testing.T) {
+	t.Run("Should accept only operator overrides and preserve destructive hints [UT-002]", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name, owner, catalog      string
+			origin                    toolspkg.MCPReadOnlyOverrideOrigin
+			destructive, wantOverride bool
+		}{
+			{name: "Should retain operator override for authority mapping", wantOverride: true, origin: toolspkg.MCPReadOnlyOverrideOperatorConfig},
+			{name: "Should retain agent origin for authority mapping", wantOverride: true, origin: toolspkg.MCPReadOnlyOverrideAgentDefinition},
+			{name: "Should ignore extension override", owner: "extension:fixture"},
+			{name: "Should ignore catalog override", catalog: "fixture"},
+			{name: "Should preserve destructive hint", destructive: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				executor := &CallExecutor{}
+				tool := mcpsdk.Tool{
+					Name:        "read",
+					InputSchema: json.RawMessage(`{"type":"object"}`),
+					Annotations: &mcpsdk.ToolAnnotations{DestructiveHint: new(tc.destructive)},
+				}
+				descriptors, err := executor.descriptorsFromTools(
+					toolspkg.SourceRef{},
+					&ResolvedServer{ReadOnlyOverrideOrigin: new(tc.origin), Server: compozyconfig.MCPServer{
+						Name:          "fixture",
+						Owner:         tc.owner,
+						CatalogEntry:  tc.catalog,
+						ReadOnlyTools: []string{"read"},
+					}},
+					[]*mcpsdk.Tool{&tool},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				d := descriptors[0]
+				if d.ReadOnlyOverrideOrigin != tc.origin || d.ReadOnly || d.ReadOnlyOverride != tc.wantOverride ||
+					d.Destructive != tc.destructive {
+					t.Fatalf("descriptor=%+v", d)
+				}
+			})
+		}
+	})
+}
+
+func TestClientInputConnection(t *testing.T) {
+	t.Parallel()
+	t.Run("Should resolve derived URL and bearer input against a real MCP server", func(t *testing.T) {
+		t.Parallel()
+		handler := newTestMCPHandler(newFakeSDKServer(nil))
+		remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer private-token" {
+				http.Error(w, "missing input", http.StatusUnauthorized)
+				return
+			}
+			handler.ServeHTTP(w, r)
+		}))
+		t.Cleanup(remote.Close)
+		server := compozyconfig.MCPServer{
+			Name:      "client",
+			Owner:     "extension:client",
+			Transport: compozyconfig.MCPServerTransportHTTP,
+			URL:       "http://${HOST}/mcp",
+			Headers:   map[string]string{"Authorization": "Bearer ${API_KEY}"},
+			InputValues: map[string]compozyconfig.MCPInputValue{
+				"HOST": {
+					Value: strings.TrimPrefix(remote.URL, "http://"),
+				},
+				"API_KEY": {SecretRef: "vault:extensions/global/client/env/API_KEY"},
+			},
+		}
+		executor := newTestMCPExecutor(
+			t,
+			server,
+			WithSecretResolver(
+				secretRefResolverFunc(func(context.Context, string) (string, error) { return "private-token", nil }),
+			),
+		)
+		if _, err := executor.ListTools(
+			t.Context(),
+			toolspkg.SourceRef{Kind: toolspkg.SourceMCP, Owner: server.Name, RawServerName: server.Name},
+		); err != nil {
+			t.Fatal(err)
+		}
+		serialized, err := json.Marshal(server)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(serialized, []byte("private-token")) {
+			t.Fatal("published declaration leaked secret")
+		}
+	})
+}
+
+func TestClientStdioLiteralInputs(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve spaces and empty rendered arguments", func(t *testing.T) {
+		t.Parallel()
+		server := compozyconfig.MCPServer{
+			Name:        "literal",
+			Command:     "node",
+			Args:        []string{" ${QUERY} ", "${EMPTY}"},
+			InputValues: map[string]compozyconfig.MCPInputValue{"QUERY": {Value: "  query  "}, "EMPTY": {Value: ""}},
+		}
+		executor := newTestMCPExecutor(t, server)
+		spec, err := executor.resolveMCPStdioSpec(t.Context(), server, userMCPExecutorTarget(server.Name))
+		if err != nil || !slices.Equal(spec.args, []string{"  query  ", ""}) {
+			t.Fatalf("literal arguments = %q, %v", spec.args, err)
+		}
+	})
 }

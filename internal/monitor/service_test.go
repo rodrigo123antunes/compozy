@@ -304,7 +304,8 @@ func TestServiceCancelAndLimits(t *testing.T) {
 				t.Fatalf("Cancel(other session) error = %v, want ErrNotFound", err)
 			}
 			canceled, err := service.Cancel("sess-a", created.ID)
-			if err != nil || canceled.Status != StatusCanceled || canceled.Reason != ReasonCancelRequested {
+			if err != nil || canceled.Status != StatusCanceled || canceled.Reason != ReasonCancelRequested ||
+				!canceled.FiredAt.IsZero() {
 				t.Fatalf("Cancel() = %+v, %v; want canceled by request", canceled, err)
 			}
 			terminals.results <- Outcome{Reason: ReasonExit}
@@ -313,7 +314,7 @@ func TestServiceCancelAndLimits(t *testing.T) {
 				t.Fatalf("notifications = %d, want 0", got)
 			}
 			listed := onlyMonitor(t, service, "sess-a")
-			if listed.Status != StatusCanceled || listed.Reason != ReasonCancelRequested {
+			if listed.Status != StatusCanceled || listed.Reason != ReasonCancelRequested || !listed.FiredAt.IsZero() {
 				t.Fatalf("listed monitor = %+v, want canceled by request", listed)
 			}
 		})
@@ -335,7 +336,8 @@ func TestServiceCancelAndLimits(t *testing.T) {
 				t.Fatalf("monitor after refusal = %+v, want delivering", got)
 			}
 			canceled, err := service.Cancel("sess-a", created.ID)
-			if err != nil || canceled.Status != StatusCanceled || canceled.Reason != ReasonCancelRequested {
+			if err != nil || canceled.Status != StatusCanceled || canceled.Reason != ReasonCancelRequested ||
+				!canceled.FiredAt.IsZero() {
 				t.Fatalf("Cancel() = %+v, %v; want canceled by request", canceled, err)
 			}
 			time.Sleep(deliveryRetryInitial*3 + time.Second)
@@ -344,7 +346,7 @@ func TestServiceCancelAndLimits(t *testing.T) {
 				t.Fatalf("wake attempts = %d, want only the refused one", got)
 			}
 			listed := onlyMonitor(t, service, "sess-a")
-			if listed.Status != StatusCanceled || listed.Reason != ReasonCancelRequested {
+			if listed.Status != StatusCanceled || listed.Reason != ReasonCancelRequested || !listed.FiredAt.IsZero() {
 				t.Fatalf("listed monitor = %+v, want canceled by request", listed)
 			}
 		})
@@ -2037,6 +2039,32 @@ func TestDetectPullRequest(t *testing.T) {
 		_, next := detectPullRequest(prCursor{}, obs, start)
 		return next
 	}
+	t.Run("Should report conflict transitions without clearing unknown observations", func(t *testing.T) {
+		t.Parallel()
+		cur := prCursor{}
+		for i, step := range []struct {
+			mergeable, head string
+			wake            bool
+		}{
+			{"unknown", "a", false}, {"conflicting", "a", true},
+			{"conflicting", "a", false}, {"unknown", "b", false},
+			{"conflicting", "b", false}, {"mergeable", "b", false},
+			{"conflicting", "b", true},
+		} {
+			obs := openPull(step.head, pending(0, 1), noReviews())
+			obs.Mergeable, obs.Base = step.mergeable, "main"
+			changes, next := detectPullRequest(cur, obs, start.Add(time.Duration(i)*time.Minute))
+			if changes.Wake != step.wake || changes.Conflict != step.wake || changes.Base != "main" {
+				t.Fatalf("step %d changes = %+v", i, changes)
+			}
+			watch := &pullRequestWatch{cursor: next}
+			restored, err := decodePullRequestWatch("repo", watch.encode())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, cur = detectPullRequest(restored.cursor, PullRequestObservation{Lookup: PullRequestFailed}, start)
+		}
+	})
 	t.Run("Should baseline reviews and threads on the first observation", func(t *testing.T) {
 		t.Parallel()
 		changes, next := detectPullRequest(prCursor{}, openPull("head-a", pending(1, 2), reviewed(3, "r1")), start)
@@ -2589,6 +2617,15 @@ func TestServicePullRequestMonitor(t *testing.T) {
 			if active := service.ActiveCounts([]string{"sess-1"})["sess-1"]; active != 1 {
 				t.Fatalf("active = %d", active)
 			}
+			canceled, err := service.Cancel("sess-1", created.ID)
+			if err != nil || !canceled.FiredAt.IsZero() || !canceled.LastFiredAt.Equal(mon.LastFiredAt) ||
+				canceled.FireCount != mon.FireCount {
+				t.Fatalf("cancel after repeated wakes = %+v, %v", canceled, err)
+			}
+			listed := onlyMonitor(t, service, "sess-1")
+			if !listed.FiredAt.IsZero() || !listed.LastFiredAt.Equal(mon.LastFiredAt) {
+				t.Fatalf("listed after repeated wakes = %+v", listed)
+			}
 		})
 	})
 	t.Run("Should end as fired on merge and release its slots", func(t *testing.T) {
@@ -2935,6 +2972,12 @@ func TestServicePullRequestMonitorSpec(t *testing.T) {
 		{"Should refuse until", func(s *Spec) { s.Until = UntilExit }},
 		{"Should refuse a delay", func(s *Spec) { s.Delay = time.Minute }},
 		{"Should refuse a timeout past 24 hours", func(s *Spec) { s.Timeout = 25 * time.Hour }},
+		{"Should refuse a qualified branch without an owner", func(s *Spec) { s.Branch = ":topic" }},
+		{"Should refuse a qualified branch without a branch", func(s *Spec) { s.Branch = "contributor:" }},
+		{"Should refuse whitespace in a qualified branch", func(s *Spec) { s.Branch = "contributor: topic" }},
+		{"Should refuse a repository as owner", func(s *Spec) { s.Branch = "acme/repo:topic" }},
+		{"Should refuse whitespace in the owner", func(s *Spec) { s.Branch = "acme corp:topic" }},
+		{"Should refuse multiple owner separators", func(s *Spec) { s.Branch = "contributor:topic:other" }},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -2946,6 +2989,21 @@ func TestServicePullRequestMonitorSpec(t *testing.T) {
 			}
 		})
 	}
+	// Invariant: qualified selectors retain GitHub owner names and slash-separated branches.
+	t.Run("Should preserve valid owners and branch slashes", func(t *testing.T) {
+		t.Parallel()
+		for _, branch := range []string{
+			"contributor:feat/topic", "Acme-123:fix/one/two", "a:topic",
+			"octocat_acme:feature/topic", "legacy--owner:topic", "legacy-:topic",
+		} {
+			spec := pullRequestSpec("sess-1")
+			spec.Branch = branch
+			normalized, err := normalizeSpec(spec)
+			if err != nil || normalized.Branch != branch {
+				t.Fatalf("branch %q normalized to %q: %v", branch, normalized.Branch, err)
+			}
+		}
+	})
 	t.Run("Should refuse branch on other kinds", func(t *testing.T) {
 		t.Parallel()
 		service := newPullRequestService(t, forge, &recordingWaker{})
@@ -3003,6 +3061,121 @@ func TestServicePullRequestMonitorRestart(t *testing.T) {
 		}
 		return after
 	}
+	for _, scenario := range []string{"push", "push without base", "retarget", "clear", "headless clear", "clear with other changes"} {
+		t.Run("Should reconcile a queued conflict after "+scenario, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				forge := &fakeForge{observation: openPull("head-a", pending(1, 3), noReviews())}
+				store := newMemoryStore()
+				refusing := &recordingWaker{errs: slices.Repeat([]error{errors.New("input queue full")}, 64)}
+				before := durableWatch(t, forge, store, refusing)
+				if _, err := before.Create(t.Context(), pullRequestSpec("sess-1")); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				obs := openPull("head-a", failing(2, "lint"), noReviews())
+				obs.Base = "main"
+				forge.set(obs)
+				poll(2)
+				obs.Mergeable = "conflicting"
+				if scenario == "clear with other changes" {
+					obs.Checks = failing(1, "lint", "test")
+				}
+				forge.set(obs)
+				poll(2)
+				isPush := strings.HasPrefix(scenario, "push")
+				switch {
+				case isPush:
+					obs.Head, obs.Mergeable = "head-b", "unknown"
+					obs.Checks = pending(1, 3)
+					if scenario == "push without base" {
+						obs.Base = ""
+					}
+				case scenario == "retarget":
+					obs.Base = "release"
+				default:
+					obs.Mergeable = "mergeable"
+					if scenario == "headless clear" {
+						obs.Head = ""
+					}
+				}
+				forge.set(obs)
+				poll(2)
+				waker := &recordingWaker{}
+				restart(t, before, forge, store, waker)
+				synctest.Wait()
+				poll(1)
+				got := waker.notifications()
+				want := 2
+				if scenario == "clear" || scenario == "headless clear" {
+					want = 1
+				}
+				if len(got) != want {
+					t.Fatalf("wakes = %+v", got)
+				}
+				if want == 2 && got[1].PullRequest.Conflict != (isPush || scenario == "retarget") {
+					t.Fatalf("queued wake = %+v", got[1].PullRequest)
+				}
+				if want == 2 && got[1].PullRequest.Conflict {
+					base := "main"
+					if scenario == "retarget" {
+						base = "release"
+					}
+					if got[1].PullRequest.Base != base {
+						t.Fatalf("queued base = %+v", got[1].PullRequest)
+					}
+				}
+				if scenario == "clear with other changes" && !slices.Contains(got[1].PullRequest.NewlyFailed, "test") {
+					t.Fatalf("lost check failure = %+v", got[1].PullRequest)
+				}
+				obs.Mergeable = "conflicting"
+				forge.set(obs)
+				poll(2)
+				expected := want
+				if !isPush && scenario != "retarget" {
+					expected++
+				}
+				if got := waker.notifications(); len(got) != expected {
+					t.Fatalf("repeat wakes = %+v", got)
+				}
+			})
+		})
+	}
+	t.Run("Should preserve conflicts through restart and unknown reads", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			obs := openPull("head-a", pending(0, 1), noReviews())
+			obs.Mergeable, obs.Base = "conflicting", "main"
+			forge := &fakeForge{observation: obs}
+			store, waker := newMemoryStore(), &recordingWaker{}
+			before := durableWatch(t, forge, store, waker)
+			if _, err := before.Create(t.Context(), pullRequestSpec("sess-1")); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Wait()
+			obs.Mergeable = "unknown"
+			forge.set(obs)
+			after := restart(t, before, forge, store, waker)
+			poll(1)
+			obs.Mergeable = "conflicting"
+			forge.set(obs)
+			poll(2)
+			if got := waker.notifications(); len(got) != 1 {
+				t.Fatalf("duplicate wakes = %+v", got)
+			}
+			obs.Mergeable = "mergeable"
+			forge.set(obs)
+			poll(1)
+			obs.Mergeable = "conflicting"
+			forge.set(obs)
+			poll(1)
+			got := waker.notifications()
+			if len(got) != 2 || !strings.Contains(got[1].Message(), "PR #7 now conflicts with main; rebase") ||
+				onlyMonitor(t, after, "sess-1").Status != StatusActive {
+				t.Fatalf("wakes = %+v", got)
+			}
+		})
+	})
 	t.Run("Should keep the baseline, so changes during downtime still wake", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
@@ -3152,6 +3325,28 @@ func TestServicePullRequestMonitorRestart(t *testing.T) {
 func TestNotificationPullRequest(t *testing.T) {
 	t.Parallel()
 	mon := Monitor{ID: "mon-1", Kind: KindPullRequest, Branch: "feat/x", FireCount: 3, Description: "watch"}
+	t.Run("Should describe the base branch when the provider omits its name", func(t *testing.T) {
+		t.Parallel()
+		for _, base := range []string{"", "  \n"} {
+			changes := &PullRequestChanges{Wake: true, Number: 7, State: "open", Base: base, Conflict: true}
+			text := (Notification{Monitor: mon, PullRequest: changes}).Message()
+			if !strings.Contains(text, "PR #7 now conflicts with its base branch; rebase") {
+				t.Fatalf("conflict message = %s", text)
+			}
+		}
+	})
+	t.Run("Should omit rebase guidance when a queued conflict ends", func(t *testing.T) {
+		t.Parallel()
+		for _, terminal := range []string{pullRequestMerged, pullRequestClosed} {
+			changes := &PullRequestChanges{
+				Wake: true, Number: 7, State: terminal, Terminal: terminal, Base: "main", Conflict: true,
+			}
+			text := (Notification{Monitor: mon, PullRequest: changes}).Message()
+			if strings.Contains(text, "; rebase") || !strings.Contains(text, "pull request "+terminal) {
+				t.Fatalf("terminal wake = %s", text)
+			}
+		}
+	})
 	t.Run("Should keep forge text inside its untrusted block", func(t *testing.T) {
 		t.Parallel()
 		changes := &PullRequestChanges{
@@ -3351,6 +3546,45 @@ func wokenTargets(t *testing.T, waker *recordingWaker, want int) []Notification 
 }
 
 func TestServiceSessionMonitorConditions(t *testing.T) {
+	// Invariant: caller-owned slices cannot change captured target ownership after registration.
+	// Owner: monitor service; canonical suite: TestServiceSessionMonitorConditions.
+	t.Run("Should retain immutable target scopes across input and returned snapshots", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			service := newTargetService(
+				t,
+				newFakeTargets(map[string]string{"sess-a": "running"}),
+				&recordingWaker{},
+				nil,
+			)
+			spec := sessionSpec("sess-o", "sess-a")
+			want := TargetScope{SessionID: "sess-a", WorkspaceID: "ws-private", ProfileID: "p-private"}
+			spec.TargetScopes = []TargetScope{want}
+			created, err := service.Create(t.Context(), spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec.TargetScopes[0].WorkspaceID = "mutated-input"
+			created.TargetScopes[0].ProfileID = "mutated-created"
+			listed := onlyMonitor(t, service, "sess-o")
+			if !slices.Equal(listed.TargetScopes, []TargetScope{want}) {
+				t.Fatalf("retained scopes = %+v", listed.TargetScopes)
+			}
+			listed.TargetScopes[0].WorkspaceID = "mutated-list"
+			reused, err := service.Create(t.Context(), sessionSpec("sess-o", "sess-a"))
+			if err != nil || !reused.Reused || !slices.Equal(reused.TargetScopes, []TargetScope{want}) {
+				t.Fatalf("reused scopes = %+v, %v", reused, err)
+			}
+			reused.TargetScopes[0].ProfileID = "mutated-reused"
+			canceled, err := service.Cancel("sess-o", created.ID)
+			if err != nil || !slices.Equal(canceled.TargetScopes, []TargetScope{want}) {
+				t.Fatalf("canceled scopes = %+v, %v", canceled, err)
+			}
+			canceled.TargetScopes[0].WorkspaceID = "mutated-canceled"
+			if got := onlyMonitor(t, service, "sess-o"); !slices.Equal(got.TargetScopes, []TargetScope{want}) {
+				t.Fatalf("retained canceled scopes = %+v", got.TargetScopes)
+			}
+		})
+	})
 	t.Run("Should wake once with every target state after all targets settle", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			targets := newFakeTargets(map[string]string{"sess-a": "running", "sess-b": "running"})
@@ -3848,7 +4082,9 @@ func TestServiceSessionMonitorsAcrossRestart(t *testing.T) {
 			store, waker := newMemoryStore(), &recordingWaker{}
 			targets := newFakeTargets(map[string]string{"sess-a": "running"})
 			first := newTargetService(t, targets, waker, store)
-			created, err := first.Create(t.Context(), sessionSpec("sess-o", "sess-a"))
+			spec := sessionSpec("sess-o", "sess-a")
+			spec.TargetScopes = []TargetScope{{SessionID: "sess-a", WorkspaceID: "ws-foreign", ProfileID: "p-other"}}
+			created, err := first.Create(t.Context(), spec)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3862,7 +4098,8 @@ func TestServiceSessionMonitorsAcrossRestart(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := wokenTargets(t, waker, 1)
-			if got[0].Monitor.ID != created.ID || got[0].Outcome.Targets[0].State != TargetStateGone {
+			if got[0].Monitor.ID != created.ID || got[0].Outcome.Targets[0].State != TargetStateGone ||
+				!slices.Equal(got[0].Monitor.TargetScopes, spec.TargetScopes) {
 				t.Fatalf("recovered wake = %+v", got[0])
 			}
 		})

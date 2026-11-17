@@ -876,7 +876,13 @@ describe("SessionChatRuntimeProvider", () => {
         pathname ===
         `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/interactions`
       ) {
-        return jsonResponse({ interactions: settledInteractions });
+        return jsonResponse({
+          interactions: settledInteractions.filter(
+            row =>
+              !requestURL.searchParams.get("status") ||
+              row.status === requestURL.searchParams.get("status")
+          ),
+        });
       }
 
       if (
@@ -2262,6 +2268,49 @@ describe("SessionChatRuntimeProvider", () => {
     }
   );
 
+  // UT-W10 (spec mcp-extension-hot-activation, Rule 9): a reload that could not start the runtime
+  // refuses the prompt before acceptance (`409 session_mcp_reload_failed`), so that message's draft
+  // comes back to the composer and sending it again retries. An ambiguous 5xx stays unconfirmed:
+  // "Should retain a prompt answered with a 5xx as pending-ack instead of restoring the draft".
+  // Owning layer: chat-runtime send recovery. Canonical suite: this file.
+  it("UT-W10: Should restore the draft when an MCP reload refuses the prompt", async () => {
+    const answer = createDeferred<Response>();
+    promptResponsePromise = answer.promise;
+    const unconfirmed: string[] = [];
+    const user = userEvent.setup();
+    renderSessionThread({
+      includeToaster: true,
+      onUnconfirmedSend: messageId => unconfirmed.push(messageId),
+    });
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Check Sentry now");
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    answer.resolve(
+      jsonResponse(
+        {
+          // The daemon's own sentence (`MCPReloadError.Error`), code suffix included.
+          error:
+            "Couldn't start Claude Code with the new MCP servers: exit status 1. Your message wasn't sent. (session_mcp_reload_failed)",
+          code: "session_mcp_reload_failed",
+          retryable: true,
+          client_message_id: lastPromptMessageID,
+          provider_error: "exit status 1",
+        },
+        { status: 409 }
+      )
+    );
+
+    expect(
+      await screen.findByText(
+        "Message not sent: Couldn't start Claude Code with the new MCP servers: exit status 1. Your draft was kept."
+      )
+    ).toBeInTheDocument();
+    await waitFor(() => expect(composerText()).toBe("Check Sentry now"));
+    expect(unconfirmed).toEqual([]);
+  });
+
   it("Should name the daemon's reason when it refuses a prompt", async () => {
     promptResponsePromise = Promise.resolve(
       jsonResponse({ error: "session is archived" }, { status: 409 })
@@ -3231,6 +3280,7 @@ describe("SessionChatRuntimeProvider", () => {
             data: {
               type: "permission",
               request_id: requestId,
+              turn_id: "turn_001",
               title: "compozy__terminal_exec",
               action: "session/request_permission",
               timestamp: "2026-09-05T10:00:00Z",
@@ -3281,7 +3331,10 @@ describe("SessionChatRuntimeProvider", () => {
 
     await act(async () => {
       await vi.waitFor(() =>
-        expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled"])
+        expect(interactionFetchSearches(fetchMock)).toEqual([
+          "?status=canceled",
+          "?status=timed_out",
+        ])
       );
     });
     expect(screen.getByTestId("permission-waiting-line")).toBeInTheDocument();
@@ -3291,7 +3344,12 @@ describe("SessionChatRuntimeProvider", () => {
       await vi.advanceTimersByTimeAsync(5_500);
     });
 
-    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled", "?status=canceled"]);
+    expect(interactionFetchSearches(fetchMock)).toEqual([
+      "?status=canceled",
+      "?status=timed_out",
+      "?status=canceled",
+      "?status=timed_out",
+    ]);
     expect(screen.getByTestId("user-message-rewind")).toBeEnabled();
   }, 10_000);
 
@@ -3315,7 +3373,7 @@ describe("SessionChatRuntimeProvider", () => {
       "Not decided · CompozyOS restarted before you answered — bun test did not run"
     );
     expect(screen.queryByTestId("permission-waiting-line")).not.toBeInTheDocument();
-    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled"]);
+    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled", "?status=timed_out"]);
     // The other rewind blockers (pending clarifications, queued inputs) settle on
     // their own reads; the settled ask must not be the one holding rewind.
     await act(async () => {
@@ -3326,7 +3384,7 @@ describe("SessionChatRuntimeProvider", () => {
       await vi.advanceTimersByTimeAsync(11_000);
     });
 
-    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled"]);
+    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled", "?status=timed_out"]);
     expect(screen.getByTestId("permission-expired-receipt")).toBeInTheDocument();
     expect(screen.getByTestId("user-message-rewind")).toBeEnabled();
   }, 10_000);
