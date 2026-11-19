@@ -1,5 +1,115 @@
 # Compozy Change Impact
 
+## Composer reply answers a pending clarification (GH-1821)
+
+- **Native tools and CLI/HTTP/UDS.** Routes, DTOs and tool schemas keep their shapes. One answer
+  rule tightens: a provider select question (ACP `elicitation/create` `oneOf` field) without a
+  `<key>_custom` text companion now refuses a text answer with `ErrClarifyInvalid` (HTTP 400; the
+  native answer tool's existing invalid-answer error), leaving the question answerable. Before,
+  the text was accepted, then declined to the provider and lost. `compozy__clarify` questions still accept text.
+- **Extensibility, hooks and config.** No hook, SDK, extension or config key changes;
+  `tools.clarify.timeout` keeps its meaning for unanswered questions.
+- **Workspace and profile isolation.** The composer answer uses the dock's answer endpoint and
+  scope.
+- **Web, docs and official skill.** While a clarification is pending, a steer or queue send from
+  the main composer answers it as free text. A question that settled first passes the text to the
+  next pending question, or to the original send when none waits; a send with files or a refused
+  choice-only answer keeps its draft with the reason; a lost acknowledgment is reconciled against
+  the live pending list and never re-sent as a prompt. Stopping sessions and interrupt keep their
+  behavior. The composer placeholder states the routing. The official skill's clarification note
+  documents the choice-only rule. `RT-session-clarification-roundtrip` records the walk.
+
+## Gateway manual 6-digit pairing and device removal — 2026-11-18
+
+Owner: branch `run/gateway-manual-6-digit-pairing-device-removal-backend-a87a1177`.
+
+- **Native tools.** `compozy__gateway` gains the `device_remove` action with required `device_id`
+  and a `remove` result envelope; the descriptor keeps its existing risk, permission and redaction
+  posture. Existing actions and schemas are unchanged.
+- **CLI/HTTP/UDS.** `POST /api/gateway/pairings` adds `manual_code` to the 201 body, and
+  `POST /api/gateway/pairings/redeem` accepts `manual_code` while `artifact` becomes optional.
+  `DELETE /api/gateway/devices/{id}/record` (`removeGatewayDevice`) is new on HTTP and UDS and
+  returns the removed snapshot with `revoked` and `canceled`. The frozen revoke route and payload
+  keep their shape. `compozy device remove` and `compozy pair redeem <artifact-or-code>` are added;
+  `compozy pair mint` prints the manual code beside the private artifact file.
+- **Extensibility, hooks and config.** No config key, hook, extension contract or manifest change.
+  Pairing TTL and pending limits are reused as-is.
+- **State and isolation.** Manual codes live in a hashed code-to-artifact-digest index inside the
+  process-local pairing store, swept and evicted with their entry, and are never persisted. Device
+  records still live per profile in global SQLite; removal honors the actor-scoped revoke epoch and
+  deletes only after the durable `gateway.device.removed` append succeeds. Revoked rows stay listed
+  until explicitly removed.
+- **Web, official skill, docs and QA.** The web lane consumes the additive payload fields and the new
+  route separately. The native tool reference lists `device_remove`, the gateway quickstart, manage,
+  and remote-access pages document the typed code and removal, generated CLI docs include
+  `compozy device remove`, and RT-gateway-paired-device records the new backend receipts without
+  claiming a product walk.
+
+## MCP OAuth refresh for CIMD clients
+
+Owner: [#1828](https://github.com/compozy/compozy/issues/1828).
+
+- **Native tools and CLI/HTTP/UDS.** MCP status reports a usable CIMD registration with a stored
+  refresh token as refreshable. Discovery and calls use the existing refresh path with the
+  persisted public client ID and keep the granted scopes when a renewal response omits `scope`.
+  The status fields, command flags and API routes keep their shapes.
+- **Extensibility, hooks and config.** Manual and extension-owned servers share the repair.
+  Registration strategy, configuration keys, hooks and SDK contracts stay the same.
+- **State and isolation.** The OAuth token registration loader resolves public-client auth for
+  new and existing CIMD rows in memory. DCR records keep their stored auth method and reuse rules.
+  SQLite rows keep their shape. The target, definition, resource, issuer and scope checks still
+  apply. CIMD renewal checks the configured callback URI, and a concurrent client replacement
+  cannot send a refresh token with the replacement client ID.
+- **Web, official skill, docs and QA.** Settings omits manual reauthorization for expiry alone
+  when the token can renew and retains it when the runtime reports a failed refresh.
+  The MCP skill reference and the ET-api-mcp-oauth-endpoints and
+  ET-web-mcp-status-matrix scenarios cover automatic renewal of new and existing CIMD clients.
+
+## MCP OAuth root protected-resource discovery
+
+Owner: [#1823](https://github.com/compozy/compozy/issues/1823).
+
+- **CLI, HTTP, UDS and Web.** Sign-in and hosted refresh accept either root resource spelling
+  during well-known metadata fallback. The authorization and token requests still use the
+  configured MCP resource. Commands, routes, and response shapes are unchanged.
+- **Native tools and official skill.** MCP status and authentication status retain their tool IDs,
+  schemas, and repair instructions.
+- **Extensibility, hooks and config.** Discovery uses the existing authorized HTTP client.
+  Extension contracts, hook behavior, and config keys are unchanged.
+- **State and isolation.** Scope selection, registration and token storage are unchanged.
+- **Docs and QA.** ET-047 covers the path-specific 404, root fallback, scoped sign-in, and
+  rejection of mismatched resources. The auth adapter suite exercises a local HTTP OAuth server.
+
+## Keyboard-first desktop navigation
+
+Owner: [#1826](https://github.com/compozy/compozy/issues/1826).
+
+- **Native tools.** `compozy__window_open` accepts an optional `insert_edge`
+  (`left`/`right`/`top`/`bottom`) beside `insert_tiled`; the daemon rejects it without
+  `insert_tiled`, with `stack_target_window_id` or legacy `floating`, or with another value. Tool ids
+  and the remaining schema are unchanged. The palette catalog adds `window.split.right`,
+  `window.split.down` and `settings.shortcuts`; existing command ids are kept.
+- **CLI/HTTP/UDS.** Additive `insert_edge` on the `window.open` payload (OpenAPI enum
+  `WindowManagerInsertEdge`) and `compozy window open --edge`, which requires `--tiled` and conflicts
+  with `--restore` and `--stack-target`. Nothing is removed or renamed.
+- **Extensibility, hooks and config.** `[window_manager.shortcuts]` grammar and every command id are
+  unchanged. Defaults change (Option+H/J/K/L focus, Option+; splits, Control+Option+↑/↓ sessions,
+  `window.tile.top|bottom` unbound). A stored override that collides with a new default keeps its
+  chord on every read (`TolerantEffectiveKeymap`, `EffectiveStoredKeymap`); recording a new colliding
+  chord still returns `shortcut_conflict`. Extension defaults keep their bind-if-free rule against
+  the new map. Electron global hotkeys accept the canonical `control` modifier.
+- **User state.** No schema or migration. Values a user applied from the retired Terminal preset stay
+  in `config.toml` and remain valid.
+- **Workspace isolation.** Workspace keymaps resolve from the shipped defaults plus the merged global
+  and workspace overrides, so a global override never leaks a displaced default into a project.
+- **Web.** One chord-eligibility policy for the shell listener and the terminal; Settings ›
+  Shortcuts (`/settings/shortcuts`) owns the keymap table and global hotkeys; the Terminal preset
+  card is removed; `/settings/layouts?command=` redirects (remove in v0.9.0); the session rail walk
+  visits headers and rows in screen order.
+- **Official skill, docs and QA.** Updated `skills/compozy` window-management and native-tools
+  references, the site shortcut and window-management pages, the release note, and the
+  keyboard/settings QA scenarios (Terminal preset scenario retired).
+
 ## Pull request monitor check rounds
 
 Owner: [#1807](https://github.com/compozy/compozy/issues/1807).
@@ -6489,3 +6599,19 @@ workspace/profile isolation keep their existing contracts. No Web source or E2E 
 changes. `TestWindowManagerHandlers` owns admission/cancellation and persisted read-back;
 the unchanged Tabs-split E2E-004 and `ET-web-desktop-shell-lifecycle` own browser acceptance.
 Main CI is the only execution gate under the release directive.
+
+## Unprompted always-on main restart (GH-1815)
+
+- **Native tools and CLI/HTTP/UDS.** `ensure-main` reports a session conflict for an active
+  instance whose main remains stopped after shutdown. Session history uses the existing
+  `session.restart_skipped` event, correlated with the lifecycle stop when there is no prompt.
+  Heartbeat can deliver its first prompt to a new or reopened unbound main of an active instance.
+- **Extensibility, config and user state.** Recovery reuses logical session resume and the
+  existing `session.restart.auto_continue` setting. Hook, SDK, config and storage shapes stay
+  the same.
+- **Workspace and profile isolation.** Recovery requires the current main of the active
+  instance and uses existing workspace resolution and permission ceilings.
+- **Web, docs and official skill.** Existing instance attention and session events surface a
+  refused resume. The official runtime reference documents the behavior and `ensure-main` error.
+  `RT-daemon-restart-continuation` and `TestBootResumesInstancesAfterServersStart` cover the first
+  Heartbeat, a refused reopen and operator stops.
