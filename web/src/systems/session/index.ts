@@ -246,11 +246,6 @@ export {
   resolveSessionOwner,
   sessionOwnerDialogState,
 } from "./lib/session-owner-resolution";
-export {
-  sessionOwnerKeys,
-  sessionOwnerOptions,
-  type SessionOwnerDialogState,
-} from "./lib/query-options";
 export { fetchSessionOwner } from "./adapters/session-owner-api";
 export {
   SESSION_WORKSPACE_SWITCH_STATES,
@@ -259,6 +254,9 @@ export {
   type SessionWorkspaceSwitchState,
 } from "./lib/session-deeplink-search";
 export {
+  sessionOwnerKeys,
+  sessionOwnerOptions,
+  type SessionOwnerDialogState,
   sessionClarificationsOptions,
   sessionCommandsOptions,
   sessionExpiredInteractionsOptions,
@@ -411,12 +409,7 @@ export { SessionSidebar, type SessionSidebarProps } from "./components/session-s
 export { SessionSidebarLayout } from "./components/session-sidebar-layout";
 export { sessionThreadFolds } from "./lib/session-sidebar-scope";
 export { walkSessionList } from "./lib/session-list-stops";
-export {
-  claimSessionComposerFocus,
-  requestSessionComposerFocus,
-  sessionComposerFocusStore,
-  withoutSessionComposerFocus,
-} from "./lib/session-composer-focus";
+export * from "./composer-focus";
 export {
   buildSessionTree,
   childSessionSignalState,

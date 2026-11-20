@@ -4,6 +4,19 @@ package client
 
 import "time"
 
+// SettingsDefaultsPayload is a daemon API value.
+type SettingsDefaultsPayload struct {
+	Agent           string `json:"agent"`
+	Provider        string `json:"provider,omitempty"`
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+}
+
+// SettingsDesktopPayload is a daemon API value.
+type SettingsDesktopPayload struct {
+	EditorCommand string `json:"editor_command"`
+}
+
 // SettingsExtensionDevPayload is a daemon API value.
 type SettingsExtensionDevPayload struct {
 	WatchInterval string `json:"watch_interval"`
@@ -430,15 +443,4 @@ type SettingsObservabilityResponse struct {
 	Config          SettingsObservabilityConfigPayload  `json:"config"`
 	Runtime         SettingsObservabilityRuntimePayload `json:"runtime"`
 	LogTail         SettingsLogTailCapabilityPayload    `json:"log_tail"`
-}
-
-// SettingsObservabilityRuntimePayload is a daemon API value.
-type SettingsObservabilityRuntimePayload struct {
-	Available          bool   `json:"available"`
-	Status             string `json:"status,omitempty"`
-	GlobalDBSizeBytes  int64  `json:"global_db_size_bytes"`
-	SessionDBSizeBytes int64  `json:"session_db_size_bytes"`
-	ActiveSessions     int    `json:"active_sessions"`
-	ActiveAgents       int    `json:"active_agents"`
-	UptimeSeconds      int64  `json:"uptime_seconds"`
 }

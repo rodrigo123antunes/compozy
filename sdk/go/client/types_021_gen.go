@@ -4,6 +4,19 @@ package client
 
 import "time"
 
+// SessionRepairResponse is a daemon API value.
+type SessionRepairResponse struct {
+	Repair SessionRepairPayload `json:"repair"`
+}
+
+// SessionResponse is a daemon API value.
+type SessionResponse struct {
+	Session SessionPayload `json:"session"`
+}
+
+// SessionReviewDecision is a daemon API value.
+type SessionReviewDecision string
+
 // SessionRuntimePayload is a daemon API value.
 type SessionRuntimePayload struct {
 	Status            SessionRuntimeStatus           `json:"status"`
@@ -433,17 +446,4 @@ type SettingsDaemonRuntimePayload struct {
 	ActiveAgents   int        `json:"active_agents"`
 	TotalSessions  int        `json:"total_sessions"`
 	Version        string     `json:"version,omitempty"`
-}
-
-// SettingsDefaultsPayload is a daemon API value.
-type SettingsDefaultsPayload struct {
-	Agent           string `json:"agent"`
-	Provider        string `json:"provider,omitempty"`
-	Model           string `json:"model,omitempty"`
-	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-}
-
-// SettingsDesktopPayload is a daemon API value.
-type SettingsDesktopPayload struct {
-	EditorCommand string `json:"editor_command"`
 }

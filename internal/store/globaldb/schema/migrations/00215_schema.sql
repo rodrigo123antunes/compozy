@@ -1,27 +1,3 @@
 -- +goose Up
--- create "deleted_session_budget_lineage" table
-CREATE TABLE `deleted_session_budget_lineage` (`id` text NOT NULL, `profile_id` text NOT NULL, `parent_session_id` text NULL, `instance_id` text NULL, `lineage_kind` text NOT NULL, PRIMARY KEY (`id`), CONSTRAINT `0` FOREIGN KEY (`profile_id`) REFERENCES `profiles` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE);
--- create index "idx_deleted_session_budget_lineage_parent" to table: "deleted_session_budget_lineage"
-CREATE INDEX `idx_deleted_session_budget_lineage_parent` ON `deleted_session_budget_lineage` (`parent_session_id`, `profile_id`);
--- apply declarative trigger "preserve_deleted_session_budget_lineage" on table "sessions"
--- +goose StatementBegin
-CREATE TRIGGER preserve_deleted_session_budget_lineage
-BEFORE DELETE ON sessions
-WHEN EXISTS (
-    SELECT 1 FROM sessions child WHERE child.parent_session_id = OLD.id
-      AND child.profile_id = OLD.profile_id
-      AND child.lineage_kind NOT IN ('continue', 'fork', 'provenance', 'side')
-)
-OR EXISTS (
-    SELECT 1 FROM deleted_session_budget_lineage child WHERE child.parent_session_id = OLD.id
-      AND child.profile_id = OLD.profile_id
-      AND child.lineage_kind NOT IN ('continue', 'fork', 'provenance', 'side')
-)
-BEGIN
-    INSERT INTO deleted_session_budget_lineage(id, profile_id, parent_session_id, instance_id, lineage_kind)
-    VALUES (OLD.id, OLD.profile_id, OLD.parent_session_id, OLD.instance_id, OLD.lineage_kind)
-    ON CONFLICT(id) DO UPDATE SET profile_id = excluded.profile_id,
-        parent_session_id = excluded.parent_session_id, instance_id = excluded.instance_id,
-        lineage_kind = excluded.lineage_kind;
-END;
--- +goose StatementEnd
+-- create "agent_instance_daily_budget_usage" table
+CREATE TABLE `agent_instance_daily_budget_usage` (`instance_id` text NOT NULL, `profile_id` text NOT NULL, `day` text NOT NULL, `total_tokens` integer NOT NULL, `usd_total` text NULL, `has_unpriced_usage` integer NOT NULL, `invalid` integer NOT NULL, PRIMARY KEY (`instance_id`, `profile_id`, `day`), CONSTRAINT `0` FOREIGN KEY (`profile_id`) REFERENCES `profiles` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE, CONSTRAINT `1` FOREIGN KEY (`instance_id`) REFERENCES `agent_instances` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE, CHECK (length(day) = 10), CHECK (total_tokens >= 0), CHECK (has_unpriced_usage IN (0, 1)), CHECK (invalid IN (0, 1)));

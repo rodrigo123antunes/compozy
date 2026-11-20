@@ -4,6 +4,16 @@ package client
 
 import "time"
 
+// SessionInputMentionPayload is a daemon API value.
+type SessionInputMentionPayload struct {
+	Kind   SessionMentionKind `json:"kind"`
+	Token  string             `json:"token"`
+	Target string             `json:"target"`
+	Label  string             `json:"label"`
+	Start  int                `json:"start"`
+	End    int                `json:"end"`
+}
+
 // SessionInputPayload is a daemon API value.
 type SessionInputPayload struct {
 	HeldReason       string                          `json:"held_reason,omitempty"`
@@ -435,16 +445,3 @@ type SessionRepairPayload struct {
 	Actions   []SessionRepairActionPayload `json:"actions"`
 	Persisted bool                         `json:"persisted"`
 }
-
-// SessionRepairResponse is a daemon API value.
-type SessionRepairResponse struct {
-	Repair SessionRepairPayload `json:"repair"`
-}
-
-// SessionResponse is a daemon API value.
-type SessionResponse struct {
-	Session SessionPayload `json:"session"`
-}
-
-// SessionReviewDecision is a daemon API value.
-type SessionReviewDecision string

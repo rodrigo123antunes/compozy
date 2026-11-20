@@ -1,11 +1,21 @@
 -- +goose Up
--- create "agent_instance_daily_budget_limits" table
-CREATE TABLE `agent_instance_daily_budget_limits` (`instance_id` text NOT NULL, `token_cap` integer NULL, `usd_cap` text NULL, `updated_at` text NOT NULL, PRIMARY KEY (`instance_id`), CONSTRAINT `0` FOREIGN KEY (`instance_id`) REFERENCES `agent_instances` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE, CHECK (token_cap IS NULL OR token_cap >= 0), CHECK (usd_cap IS NULL OR length(trim(usd_cap)) > 0));
--- create "agent_instance_daily_budget_notices" table
-CREATE TABLE `agent_instance_daily_budget_notices` (`instance_id` text NOT NULL, `day` text NOT NULL, `issued_at` text NOT NULL, PRIMARY KEY (`instance_id`, `day`), CONSTRAINT `0` FOREIGN KEY (`instance_id`) REFERENCES `agent_instances` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE, CHECK (length(day) = 10));
--- create "token_usage_receipts" table
-CREATE TABLE `token_usage_receipts` (`profile_id` text NOT NULL, `session_id` text NOT NULL, `turn_id` text NOT NULL, `instance_id` text NOT NULL DEFAULT '', `day` text NOT NULL, `total_tokens` integer NOT NULL DEFAULT 0, `usd_amount` text NULL, `cost_status` text NOT NULL, `created_at` text NOT NULL, PRIMARY KEY (`session_id`, `turn_id`), CONSTRAINT `0` FOREIGN KEY (`profile_id`) REFERENCES `profiles` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE, CHECK (length(trim(turn_id)) > 0), CHECK (total_tokens >= 0));
--- create index "idx_token_usage_receipts_instance_day" to table: "token_usage_receipts"
-CREATE INDEX `idx_token_usage_receipts_instance_day` ON `token_usage_receipts` (`profile_id`, `instance_id`, `day`);
--- create index "idx_token_usage_receipts_budget_cursor" to table: "token_usage_receipts"
-CREATE INDEX `idx_token_usage_receipts_budget_cursor` ON `token_usage_receipts` (`profile_id`, `instance_id`, `day`, `session_id`, `turn_id`);
+-- disable the enforcement of foreign-keys constraints
+PRAGMA foreign_keys = off;
+-- create "new_session_prompt_reply_watches" table
+CREATE TABLE `new_session_prompt_reply_watches` (`id` text NOT NULL, `workspace_id` text NOT NULL, `sender_session_id` text NOT NULL, `target_workspace_id` text NOT NULL, `target_session_id` text NOT NULL, `message_id` text NOT NULL, `admission_id` text NOT NULL, `turn_id` text NULL, `queue_entry_id` text NULL, `delivered_input_id` text NULL, `abandon_reason` text NULL, `hop` integer NOT NULL, `state` text NOT NULL, `outcome` text NULL, `reply_text` text NULL, `reply_truncated` integer NOT NULL DEFAULT 0, `created_at` text NOT NULL, `fired_at` text NULL, `delivered_at` text NULL, `follow_up_after` integer NOT NULL DEFAULT 0, `interim_wait` text NULL, PRIMARY KEY (`id`), CHECK (abandon_reason IN ('sender_gone', 'send_failed', 'superseded')), CHECK (state IN ('armed', 'fired', 'delivered', 'abandoned')), CHECK (outcome IN ('completed', 'failed', 'canceled', 'dropped', 'unknown', 'expired')));
+-- copy watches, preserving rowid for supersession ordering
+INSERT INTO `new_session_prompt_reply_watches` (`rowid`, `id`, `workspace_id`, `sender_session_id`, `target_workspace_id`, `target_session_id`, `message_id`, `admission_id`, `turn_id`, `queue_entry_id`, `delivered_input_id`, `abandon_reason`, `hop`, `state`, `outcome`, `reply_text`, `reply_truncated`, `created_at`, `fired_at`, `delivered_at`) SELECT `rowid`, `id`, `workspace_id`, `sender_session_id`, `target_workspace_id`, `target_session_id`, `message_id`, `admission_id`, `turn_id`, `queue_entry_id`, `delivered_input_id`, `abandon_reason`, `hop`, `state`, `outcome`, `reply_text`, `reply_truncated`, `created_at`, `fired_at`, `delivered_at` FROM `session_prompt_reply_watches`;
+-- drop "session_prompt_reply_watches" table after copying rows
+DROP TABLE `session_prompt_reply_watches`;
+-- rename temporary table "new_session_prompt_reply_watches" to "session_prompt_reply_watches"
+ALTER TABLE `new_session_prompt_reply_watches` RENAME TO `session_prompt_reply_watches`;
+-- create index "session_prompt_reply_watches_target_session_id_message_id" to table: "session_prompt_reply_watches"
+CREATE UNIQUE INDEX `session_prompt_reply_watches_target_session_id_message_id` ON `session_prompt_reply_watches` (`target_session_id`, `message_id`);
+-- create index "idx_reply_watches_sender_state" to table: "session_prompt_reply_watches"
+CREATE INDEX `idx_reply_watches_sender_state` ON `session_prompt_reply_watches` (`sender_session_id`, `state`);
+-- create index "idx_reply_watches_target_turn" to table: "session_prompt_reply_watches"
+CREATE INDEX `idx_reply_watches_target_turn` ON `session_prompt_reply_watches` (`target_session_id`, `turn_id`);
+-- create index "idx_reply_watches_target_queue" to table: "session_prompt_reply_watches"
+CREATE INDEX `idx_reply_watches_target_queue` ON `session_prompt_reply_watches` (`target_session_id`, `queue_entry_id`);
+-- enable back the enforcement of foreign-keys constraints
+PRAGMA foreign_keys = on;

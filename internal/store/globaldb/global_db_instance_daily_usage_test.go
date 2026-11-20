@@ -237,7 +237,7 @@ func TestDailyBudgetProjectionUpgradeSeedsOlderReceiptsExactlyOnce(t *testing.T)
 		at := time.Date(2026, 11, 19, 12, 0, 0, 0, time.Local)
 		stamp := store.FormatTimestamp(at)
 		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
-		prefix, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00214_schema.sql"))
+		prefix, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00215_schema.sql"))
 		if err != nil {
 			t.Fatal(err)
 		}

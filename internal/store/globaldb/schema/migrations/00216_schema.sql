@@ -1,13 +1,27 @@
 -- +goose Up
--- add column "app_ingress" to table: "session_prompt_admissions"
-ALTER TABLE `session_prompt_admissions` ADD COLUMN `app_ingress` integer NOT NULL DEFAULT 1;
--- add column "app_ingress" to table: "session_input_queue"
-ALTER TABLE `session_input_queue` ADD COLUMN `app_ingress` integer NOT NULL DEFAULT 1;
--- add column "ownership_unresolved" to table: "token_usage_receipts"
-ALTER TABLE `token_usage_receipts` ADD COLUMN `ownership_unresolved` integer NOT NULL DEFAULT 0;
--- create "agent_instance_daily_budget_uncertain_days" table
-CREATE TABLE `agent_instance_daily_budget_uncertain_days` (`instance_id` text NOT NULL, `day` text NOT NULL, `source_session_id` text NOT NULL, `recorded_at` text NOT NULL, PRIMARY KEY (`instance_id`, `day`), CONSTRAINT `0` FOREIGN KEY (`instance_id`) REFERENCES `agent_instances` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE, CHECK (length(day) = 10));
--- create "agent_instance_daily_budget_recovery" table
-CREATE TABLE `agent_instance_daily_budget_recovery` (`instance_id` text NULL, `generation` integer NOT NULL, `pending` integer NOT NULL, `latched` integer NOT NULL DEFAULT 0, PRIMARY KEY (`instance_id`), CONSTRAINT `0` FOREIGN KEY (`instance_id`) REFERENCES `agent_instances` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE, CHECK (generation > 0), CHECK (pending IN (0, 1)), CHECK (latched IN (0, 1)));
--- create "daily_budget_recovery_cursors" table
-CREATE TABLE `daily_budget_recovery_cursors` (`session_id` text NOT NULL, `after_sequence` integer NOT NULL, `updated_at` text NOT NULL, PRIMARY KEY (`session_id`), CHECK (after_sequence >= 0));
+-- create "deleted_session_budget_lineage" table
+CREATE TABLE `deleted_session_budget_lineage` (`id` text NOT NULL, `profile_id` text NOT NULL, `parent_session_id` text NULL, `instance_id` text NULL, `lineage_kind` text NOT NULL, PRIMARY KEY (`id`), CONSTRAINT `0` FOREIGN KEY (`profile_id`) REFERENCES `profiles` (`id`) ON UPDATE NO ACTION ON DELETE CASCADE);
+-- create index "idx_deleted_session_budget_lineage_parent" to table: "deleted_session_budget_lineage"
+CREATE INDEX `idx_deleted_session_budget_lineage_parent` ON `deleted_session_budget_lineage` (`parent_session_id`, `profile_id`);
+-- apply declarative trigger "preserve_deleted_session_budget_lineage" on table "sessions"
+-- +goose StatementBegin
+CREATE TRIGGER preserve_deleted_session_budget_lineage
+BEFORE DELETE ON sessions
+WHEN EXISTS (
+    SELECT 1 FROM sessions child WHERE child.parent_session_id = OLD.id
+      AND child.profile_id = OLD.profile_id
+      AND child.lineage_kind NOT IN ('continue', 'fork', 'provenance', 'side')
+)
+OR EXISTS (
+    SELECT 1 FROM deleted_session_budget_lineage child WHERE child.parent_session_id = OLD.id
+      AND child.profile_id = OLD.profile_id
+      AND child.lineage_kind NOT IN ('continue', 'fork', 'provenance', 'side')
+)
+BEGIN
+    INSERT INTO deleted_session_budget_lineage(id, profile_id, parent_session_id, instance_id, lineage_kind)
+    VALUES (OLD.id, OLD.profile_id, OLD.parent_session_id, OLD.instance_id, OLD.lineage_kind)
+    ON CONFLICT(id) DO UPDATE SET profile_id = excluded.profile_id,
+        parent_session_id = excluded.parent_session_id, instance_id = excluded.instance_id,
+        lineage_kind = excluded.lineage_kind;
+END;
+-- +goose StatementEnd

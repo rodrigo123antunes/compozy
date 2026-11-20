@@ -7734,9 +7734,12 @@ export type SessionConversationRewindResponse = {
 
 export type SessionDerivationPayload = {
   first_prompt: string;
+  inherited_message_count?: number | null;
   kind: "" | "provenance" | "spawn" | "continue" | "fork" | "recovery" | "side";
   native_fork_error?: string;
   native_state?: string;
+  replay_message_count?: number | null;
+  replay_omitted_count?: number | null;
   seed: string;
   source_session_id: string;
 };
@@ -7768,6 +7771,7 @@ export type SessionDerivePreviewResponse = {
   cut?: SessionDeriveCutPayload | null;
   message_count: number;
   native_fork_possible: boolean;
+  native_fork_refusal_reason?: string;
   omitted_count: number;
   replay_bytes: number;
   source_message_count: number;
@@ -27523,6 +27527,67 @@ export type GetGlobalSessionTranscriptResponses = {
 export type GetGlobalSessionTranscriptResponse =
   GetGlobalSessionTranscriptResponses[keyof GetGlobalSessionTranscriptResponses];
 
+export type GetGlobalSessionInheritedTranscriptData = {
+  body?: never;
+  path: {
+    /**
+     * Derived child session id
+     */
+    session_id: string;
+  };
+  query?: {
+    /**
+     * Maximum page size; defaults to the newest 200 entries and is capped at 1000
+     */
+    limit?: number;
+    /**
+     * Return inherited entries whose stable start sequence is before this cursor
+     */
+    before_sequence?: number;
+    /**
+     * Read one profile's rows by name
+     */
+    profile?: string;
+    /**
+     * Read the owner-labeled all-profiles aggregate
+     */
+    all_profiles?: boolean;
+  };
+  url: "/api/sessions/{session_id}/transcript/inherited";
+};
+
+export type GetGlobalSessionInheritedTranscriptErrors = {
+  /**
+   * Invalid filter
+   */
+  400: ErrorPayload;
+  /**
+   * Session not found or source transcript unavailable (inherited_transcript_unavailable)
+   */
+  404: ErrorPayload;
+  /**
+   * Internal server error
+   */
+  500: ErrorPayload;
+  /**
+   * Transcript projection is incompatible
+   */
+  503: ErrorPayload;
+};
+
+export type GetGlobalSessionInheritedTranscriptError =
+  GetGlobalSessionInheritedTranscriptErrors[keyof GetGlobalSessionInheritedTranscriptErrors];
+
+export type GetGlobalSessionInheritedTranscriptResponses = {
+  /**
+   * OK
+   */
+  200: SessionTranscriptResponse;
+};
+
+export type GetGlobalSessionInheritedTranscriptResponse =
+  GetGlobalSessionInheritedTranscriptResponses[keyof GetGlobalSessionInheritedTranscriptResponses];
+
 export type GetGlobalSessionTranscriptOutlineData = {
   body?: never;
   path: {
@@ -40029,11 +40094,11 @@ export type ContinueSessionErrors = {
    */
   404: SessionDeriveErrorPayload;
   /**
-   * Session cannot be continued
+   * Session cannot be continued or the source is busy
    */
   409: SessionDeriveErrorPayload;
   /**
-   * Runtime or authentication failure; when the new session was already created the error carries child_session_id and a retry with the same idempotency_key returns it
+   * Runtime, authentication or previously admitted first-message failure; when the new session was already created the error carries child_session_id
    */
   422: SessionDeriveErrorPayload;
   /**
@@ -40100,7 +40165,7 @@ export type PreviewSessionDeriveErrors = {
    */
   404: ErrorPayload;
   /**
-   * Session is archived
+   * Session is archived or the source is busy
    */
   409: ErrorPayload;
   /**
@@ -40728,11 +40793,11 @@ export type ForkSessionErrors = {
    */
   404: SessionDeriveErrorPayload;
   /**
-   * Session cannot be forked
+   * Session cannot be forked or the source is busy
    */
   409: SessionDeriveErrorPayload;
   /**
-   * Runtime or authentication failure; when the new session was already created the error carries child_session_id and a retry with the same idempotency_key returns it
+   * Runtime, authentication or previously admitted first-message failure; when the new session was already created the error carries child_session_id
    */
   422: SessionDeriveErrorPayload;
   /**
@@ -43128,7 +43193,7 @@ export type OpenSessionSideErrors = {
    */
   409: SessionDeriveErrorPayload;
   /**
-   * Runtime or authentication failure; when the new session was already created the error carries child_session_id and a retry with the same idempotency_key returns it
+   * Runtime, authentication or previously admitted first-message failure; when the new session was already created the error carries child_session_id
    */
   422: SessionDeriveErrorPayload;
   /**
@@ -43634,6 +43699,71 @@ export type GetSessionTranscriptResponses = {
 
 export type GetSessionTranscriptResponse =
   GetSessionTranscriptResponses[keyof GetSessionTranscriptResponses];
+
+export type GetSessionInheritedTranscriptData = {
+  body?: never;
+  path: {
+    /**
+     * Workspace id
+     */
+    workspace_id: string;
+    /**
+     * Derived child session id
+     */
+    session_id: string;
+  };
+  query?: {
+    /**
+     * Maximum page size; defaults to the newest 200 entries and is capped at 1000
+     */
+    limit?: number;
+    /**
+     * Return inherited entries whose stable start sequence is before this cursor
+     */
+    before_sequence?: number;
+    /**
+     * Read one profile's rows by name
+     */
+    profile?: string;
+    /**
+     * Read the owner-labeled all-profiles aggregate
+     */
+    all_profiles?: boolean;
+  };
+  url: "/api/workspaces/{workspace_id}/sessions/{session_id}/transcript/inherited";
+};
+
+export type GetSessionInheritedTranscriptErrors = {
+  /**
+   * Invalid filter
+   */
+  400: ErrorPayload;
+  /**
+   * Session not found or source transcript unavailable (inherited_transcript_unavailable)
+   */
+  404: ErrorPayload;
+  /**
+   * Internal server error
+   */
+  500: ErrorPayload;
+  /**
+   * Transcript projection is incompatible
+   */
+  503: ErrorPayload;
+};
+
+export type GetSessionInheritedTranscriptError =
+  GetSessionInheritedTranscriptErrors[keyof GetSessionInheritedTranscriptErrors];
+
+export type GetSessionInheritedTranscriptResponses = {
+  /**
+   * OK
+   */
+  200: SessionTranscriptResponse;
+};
+
+export type GetSessionInheritedTranscriptResponse =
+  GetSessionInheritedTranscriptResponses[keyof GetSessionInheritedTranscriptResponses];
 
 export type GetSessionTranscriptOutlineData = {
   body?: never;

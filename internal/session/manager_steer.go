@@ -145,7 +145,7 @@ func (m *Manager) injectSteeringInput(
 			steerCtx,
 			proc,
 			entry.TargetTurnID,
-			promptOriginMessage(origin, text),
+			promptOriginMessage(m.replyPromptOrigin(steerCtx, origin), text),
 			attachments,
 		)
 		cancel()

@@ -4,6 +4,17 @@ package client
 
 import "time"
 
+// SettingsObservabilityRuntimePayload is a daemon API value.
+type SettingsObservabilityRuntimePayload struct {
+	Available          bool   `json:"available"`
+	Status             string `json:"status,omitempty"`
+	GlobalDBSizeBytes  int64  `json:"global_db_size_bytes"`
+	SessionDBSizeBytes int64  `json:"session_db_size_bytes"`
+	ActiveSessions     int    `json:"active_sessions"`
+	ActiveAgents       int    `json:"active_agents"`
+	UptimeSeconds      int64  `json:"uptime_seconds"`
+}
+
 // SettingsObservabilityTranscriptPayload is a daemon API value.
 type SettingsObservabilityTranscriptPayload struct {
 	Enabled            bool  `json:"enabled"`
