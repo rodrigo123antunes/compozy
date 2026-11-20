@@ -1,10 +1,18 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
+	"strings"
+	"sync"
 	"time"
+
+	"github.com/compozy/compozy/internal/redact"
 )
 
 // DeferInitialDiscovery keeps vendor MCP startup out of the hosted session handshake.
@@ -32,7 +40,32 @@ func (p *MCPProvider) discoverSource(
 	}
 	discoveryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if BackgroundMCPDiscovery(ctx) {
+		discoveryCtx = context.WithValue(discoveryCtx, mcpDiscoveryResponseBudgetKey{}, timeout/2)
+	}
 	return p.exec.ListTools(discoveryCtx, source)
+}
+
+type mcpDiscoveryResponseBudgetKey struct{}
+type mcpOwnedDiscoveryKey struct{}
+
+// BackgroundMCPDiscovery reports whether the daemon's hosted catalog worker owns the read.
+func BackgroundMCPDiscovery(ctx context.Context) bool {
+	return ctx.Value(mcpOwnedDiscoveryKey{}) != nil
+}
+
+// MCPCatalogPollDeferred reports that a shared upstream attempt is still within its refresh interval.
+// A deferred read can reproduce the last diagnostic, but provides no new evidence of failure.
+type MCPCatalogPollDeferred struct{ Reason ReasonCode }
+
+func (*MCPCatalogPollDeferred) Error() string { return "mcp: catalog refresh interval has not elapsed" }
+
+// MCPDiscoveryResponseBudget reserves server response time inside the daemon's discovery budget.
+func MCPDiscoveryResponseBudget(ctx context.Context) time.Duration {
+	if budget, ok := ctx.Value(mcpDiscoveryResponseBudgetKey{}).(time.Duration); ok {
+		return budget
+	}
+	return 0
 }
 
 func (p *MCPProvider) cachedSourceDescriptors(source SourceRef) []Descriptor {
@@ -40,40 +73,159 @@ func (p *MCPProvider) cachedSourceDescriptors(source SourceRef) []Descriptor {
 	if !ok {
 		return nil
 	}
-	if snapshot, ok := value.(mcpDiscoverySnapshot); ok {
-		return cloneDescriptors(snapshot.descriptors)
+	snapshot, ok := value.(*mcpDiscoverySnapshot)
+	if !ok {
+		panic("invariant: discovered MCP source has an unexpected type")
 	}
-	panic("invariant: discovered MCP descriptors have an unexpected type")
+	return cloneDescriptors(snapshot.currentDescriptors())
 }
 
 type mcpDiscoverySnapshot struct {
-	raw         []MCPToolDescriptor
-	descriptors []Descriptor
+	source              SourceRef
+	content             [sha256.Size]byte
+	raw                 []MCPToolDescriptor
+	descriptors         []Descriptor
+	availabilitySources []SourceRef
+
+	mu           sync.Mutex
+	hasSafeView  bool
+	safeRevision [sha256.Size]byte
+	safe         []Descriptor
+}
+
+func (s *mcpDiscoverySnapshot) currentDescriptors() []Descriptor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.descriptorsAt(redact.RegisteredSecretSnapshot())
+}
+
+func (s *mcpDiscoverySnapshot) descriptorsAt(snapshot *redact.SecretSnapshot) []Descriptor {
+	revision := snapshot.MaterialFingerprint()
+	if s.hasSafeView && s.safeRevision == revision {
+		return s.safe
+	}
+	safe := make([]Descriptor, 0, len(s.descriptors))
+	for i, descriptor := range s.descriptors {
+		if safeMCPDescriptor(snapshot, descriptor) {
+			safe = append(safe, descriptor)
+			continue
+		}
+		redacted, err := RedactMCPToolDescriptor(s.raw[i], snapshot)
+		if err != nil {
+			continue
+		}
+		descriptor, err = mcpRegistryDescriptor(s.source, redacted)
+		if err == nil && safeMCPDescriptor(snapshot, descriptor) {
+			safe = append(safe, descriptor)
+		}
+	}
+	if revision != redact.RegisteredSecretSnapshot().MaterialFingerprint() {
+		// Preserve descriptors proven safe against the current material without caching this mixed view.
+		encoded := make([][]byte, len(safe))
+		for i := range safe {
+			if raw, err := json.Marshal(safe[i]); err == nil {
+				encoded[i] = raw
+			}
+		}
+		keep := make([]bool, len(safe))
+		redact.WithCurrentSecretSnapshot(func(current *redact.SecretSnapshot) {
+			for i, raw := range encoded {
+				keep[i] = raw != nil && safeMCPMetadata(current, raw)
+			}
+		})
+		kept := 0
+		for i, ok := range keep {
+			if ok {
+				safe[kept] = safe[i]
+				kept++
+			}
+		}
+		clear(safe[kept:])
+		safe = safe[:kept]
+		return safe
+	}
+	s.safeRevision, s.safe, s.hasSafeView = revision, safe, true
+	return safe
+}
+
+func safeMCPDescriptor(snapshot *redact.SecretSnapshot, descriptor Descriptor) bool {
+	raw, err := json.Marshal(descriptor)
+	if err != nil {
+		return false
+	}
+	return safeMCPMetadata(snapshot, raw)
+}
+
+func safeMCPMetadata(snapshot *redact.SecretSnapshot, raw []byte) bool {
+	unsafe, err := snapshot.NeedsBinaryJSONRedaction(raw)
+	return err == nil && !unsafe
 }
 
 func (p *MCPProvider) normalizeDiscovery(source SourceRef, discovered []MCPToolDescriptor) ([]Descriptor, error) {
 	if value, ok := p.discovered.Load(source); ok {
-		if cached, ok := value.(mcpDiscoverySnapshot); ok {
+		if cached, ok := value.(*mcpDiscoverySnapshot); ok {
 			// Exact equality reuses schema digests without dropping internal read-authority metadata.
 			if reflect.DeepEqual(cached.raw, discovered) {
-				return cloneDescriptors(cached.descriptors), nil
+				return cloneDescriptors(cached.currentDescriptors()), nil
 			}
 		}
 	}
 	descriptors := make([]Descriptor, 0, len(discovered))
 	raw := make([]MCPToolDescriptor, len(discovered))
+	var availabilitySources []SourceRef
+	seen := make(map[SourceRef]struct{})
 	for i := range discovered {
 		descriptor, err := mcpRegistryDescriptor(source, discovered[i])
 		if err != nil {
 			return nil, wrapField(err, fmt.Sprintf("mcp_tools[%d]", i))
 		}
 		descriptors = append(descriptors, descriptor)
+		healthSource := descriptor.Source
+		healthSource.RawToolName = ""
+		if _, found := seen[healthSource]; !found {
+			seen[healthSource] = struct{}{}
+			availabilitySources = append(availabilitySources, healthSource)
+		}
 		raw[i] = discovered[i]
 		raw[i].InputSchema = cloneRawMessage(raw[i].InputSchema)
 		raw[i].OutputSchema = cloneRawMessage(raw[i].OutputSchema)
 	}
-	p.discovered.Store(source, mcpDiscoverySnapshot{raw, cloneDescriptors(descriptors)})
-	return descriptors, nil
+	content, err := FingerprintMCPToolDescriptors(discovered)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(availabilitySources, func(a, b SourceRef) int {
+		return strings.Compare(sourceKey(a), sourceKey(b))
+	})
+	snapshot := &mcpDiscoverySnapshot{source: source, content: content, raw: raw, descriptors: descriptors,
+		availabilitySources: availabilitySources}
+	p.discovered.Store(source, snapshot)
+	return cloneDescriptors(snapshot.currentDescriptors()), nil
+}
+
+// FingerprintMCPToolDescriptors identifies the contents of one normalized listing.
+func FingerprintMCPToolDescriptors(descriptors []MCPToolDescriptor) ([sha256.Size]byte, error) {
+	canonical := make([]json.RawMessage, 0, len(descriptors))
+	for index := range descriptors {
+		// Providers may leave ID empty and let the registry derive it from the upstream name.
+		descriptor := &descriptors[index]
+		encoded, err := json.Marshal(struct {
+			*MCPToolDescriptor
+			ID string `json:"id"`
+		}{descriptor, string(descriptor.ID)})
+		if err != nil {
+			return [sha256.Size]byte{}, fmt.Errorf("mcp: encode tool projection descriptor: %w", err)
+		}
+		canonical = append(canonical, encoded)
+	}
+	slices.SortFunc(canonical, func(left, right json.RawMessage) int {
+		return bytes.Compare(left, right)
+	})
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("mcp: encode tool projection generation: %w", err)
+	}
+	return sha256.Sum256(encoded), nil
 }
 
 func cloneDescriptors(descriptors []Descriptor) []Descriptor {
@@ -85,17 +237,15 @@ func cloneDescriptors(descriptors []Descriptor) []Descriptor {
 }
 
 func (p *MCPProvider) forgetDiscovered(retire func(SourceRef) bool) {
-	p.discovered.Range(func(key, _ any) bool {
-		source, ok := key.(SourceRef)
-		if !ok {
-			panic("invariant: discovered MCP source has an unexpected type")
-		}
+	p.discoveryMu.Lock()
+	defer p.discoveryMu.Unlock()
+	for source := range p.discoveryGenerations {
 		if retire(source) {
-			p.discovered.Delete(key)
-			p.discoveryFailures.Delete(key)
+			delete(p.discoveryGenerations, source)
+			p.discovered.Delete(source)
+			p.discoveryFailures.Delete(source)
 		}
-		return true
-	})
+	}
 }
 
 func (p *MCPProvider) retainDiscoveredSources(sources []SourceRef) {
@@ -106,11 +256,15 @@ func (p *MCPProvider) retainDiscoveredSources(sources []SourceRef) {
 	// Prune against the full source inventory: a workspace override must not evict
 	// a global source's last discovery used by another workspace.
 	p.forgetDiscovered(func(source SourceRef) bool {
-		switch source.Scope {
-		case "", mcpSourceScopeUser, mcpSourceScopeWorkspace:
-			// Projection stamps the caller profile onto user and workspace sources.
-			source.ProfileID = ""
-		}
-		return !active[source]
+		return !active[MCPDeclarationSource(source)]
 	})
+}
+
+// MCPDeclarationSource removes the caller's profile from inherited declaration identities.
+func MCPDeclarationSource(source SourceRef) SourceRef {
+	switch source.Scope {
+	case "", mcpSourceScopeUser, mcpSourceScopeWorkspace:
+		source.ProfileID = ""
+	}
+	return source
 }

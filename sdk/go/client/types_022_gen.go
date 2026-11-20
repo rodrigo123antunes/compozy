@@ -4,6 +4,55 @@ package client
 
 import "time"
 
+// SettingsExtensionSourcesPayload is a daemon API value.
+type SettingsExtensionSourcesPayload struct {
+	GitHub SettingsExtensionGitHubSourcePayload `json:"github"`
+	Git    SettingsExtensionGitSourcePayload    `json:"git"`
+}
+
+// SettingsExtensionTrustPayload is a daemon API value.
+type SettingsExtensionTrustPayload struct {
+	AllowUnverified bool `json:"allow_unverified"`
+}
+
+// SettingsExtensionsConfigPayload is a daemon API value.
+type SettingsExtensionsConfigPayload struct {
+	Trust     SettingsExtensionTrustPayload     `json:"trust"`
+	Sources   SettingsExtensionSourcesPayload   `json:"sources"`
+	Dev       SettingsExtensionDevPayload       `json:"dev"`
+	Resources SettingsExtensionResourcesPayload `json:"resources"`
+}
+
+// SettingsGeneralActionsPayload is a daemon API value.
+type SettingsGeneralActionsPayload struct {
+	Restart SettingsActionMetadataPayload `json:"restart"`
+}
+
+// SettingsGeneralConfigPayload is a daemon API value.
+type SettingsGeneralConfigPayload struct {
+	BusyInput        *SettingsBusyInputPayload  `json:"busy_input,omitzero"`
+	Limits           SettingsLimitsPayload      `json:"limits"`
+	Permissions      SettingsPermissionsPayload `json:"permissions"`
+	SessionTimeout   string                     `json:"session_timeout"`
+	IdleReleaseAfter string                     `json:"idle_release_after,omitempty"`
+	HTTP             SettingsHTTPPayload        `json:"http"`
+	Daemon           SettingsDaemonPayload      `json:"daemon"`
+	Redact           SettingsRedactPayload      `json:"redact"`
+	Terminal         SettingsTerminalPayload    `json:"terminal"`
+	Desktop          *SettingsDesktopPayload    `json:"desktop,omitzero"`
+}
+
+// SettingsGeneralResponse is a daemon API value.
+type SettingsGeneralResponse struct {
+	Section         SettingsSectionName           `json:"section"`
+	Scope           SettingsUserScopeKind         `json:"scope"`
+	AvailableScopes []SettingsUserScopeKind       `json:"available_scopes"`
+	ConfigPaths     SettingsConfigPathsPayload    `json:"config_paths"`
+	Config          SettingsGeneralConfigPayload  `json:"config"`
+	Runtime         SettingsDaemonRuntimePayload  `json:"runtime"`
+	Actions         SettingsGeneralActionsPayload `json:"actions"`
+}
+
 // SettingsGlobalShortcutPayload is a daemon API value.
 type SettingsGlobalShortcutPayload struct {
 	CommandID     string                       `json:"command_id"`
@@ -241,8 +290,14 @@ type SettingsMCPSecretValuesPayload struct {
 	OAuthClientSecret *string           `json:"oauth_client_secret,omitzero"`
 }
 
+// SettingsMCPServerEnabledRequest is a daemon API value.
+type SettingsMCPServerEnabledRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
 // SettingsMCPServerItemPayload is a daemon API value.
 type SettingsMCPServerItemPayload struct {
+	Disabled           bool                                   `json:"disabled,omitzero"`
 	DefinitionSource   string                                 `json:"definition_source,omitempty"`
 	Approval           SettingsMCPApprovalStatePayload        `json:"approval"`
 	CallableInSessions bool                                   `json:"callable_in_sessions"`
@@ -386,63 +441,4 @@ type SettingsPersonaResponse struct {
 	Profile         string                     `json:"profile,omitempty"`
 	AvailableScopes []SettingsLayeredScopeKind `json:"available_scopes"`
 	Config          SettingsDefaultsPayload    `json:"config"`
-}
-
-// SettingsProviderAuthStatusPayload is a daemon API value.
-type SettingsProviderAuthStatusPayload struct {
-	Mode        string                         `json:"mode"`
-	EnvPolicy   string                         `json:"env_policy"`
-	HomePolicy  string                         `json:"home_policy"`
-	State       string                         `json:"state"`
-	Code        string                         `json:"code,omitempty"`
-	Message     string                         `json:"message,omitempty"`
-	StatusCmd   string                         `json:"status_command,omitempty"`
-	Login       ProviderLoginDescriptorPayload `json:"login"`
-	LastProbeAt *time.Time                     `json:"last_probe_at,omitempty"`
-}
-
-// SettingsProviderCredentialSlotPayload is a daemon API value.
-type SettingsProviderCredentialSlotPayload struct {
-	Name      string `json:"name"`
-	TargetEnv string `json:"target_env"`
-	SecretRef string `json:"secret_ref"`
-	Kind      string `json:"kind,omitempty"`
-	Required  bool   `json:"required"`
-}
-
-// SettingsProviderCredentialStatusPayload is a daemon API value.
-type SettingsProviderCredentialStatusPayload struct {
-	Name      string `json:"name"`
-	TargetEnv string `json:"target_env"`
-	SecretRef string `json:"secret_ref"`
-	Kind      string `json:"kind,omitempty"`
-	Required  bool   `json:"required"`
-	Present   bool   `json:"present"`
-	Source    string `json:"source,omitempty"`
-}
-
-// SettingsProviderEnabledResponse is a daemon API value.
-type SettingsProviderEnabledResponse struct {
-	Provider SettingsProviderItemPayload `json:"provider"`
-	Apply    SettingsApplyResponse       `json:"apply"`
-}
-
-// SettingsProviderFallbackPayload is a daemon API value.
-type SettingsProviderFallbackPayload struct {
-	Source   SettingsSourceRefPayload        `json:"source"`
-	Settings SettingsProviderSettingsPayload `json:"settings"`
-}
-
-// SettingsProviderItemPayload is a daemon API value.
-type SettingsProviderItemPayload struct {
-	SessionEnvStatus []SettingsProviderCredentialStatusPayload `json:"session_env_status,omitempty"`
-	Name             string                                    `json:"name"`
-	Settings         SettingsProviderSettingsPayload           `json:"settings"`
-	RuntimeStrategy  ProviderRuntimeStrategy                   `json:"runtime_strategy,omitempty"`
-	Default          bool                                      `json:"default"`
-	CommandAvailable bool                                      `json:"command_available"`
-	Credentials      []SettingsProviderCredentialStatusPayload `json:"credentials,omitempty"`
-	AuthStatus       *SettingsProviderAuthStatusPayload        `json:"auth_status,omitzero"`
-	SourceMetadata   SettingsSourceMetadataPayload             `json:"source_metadata"`
-	Fallback         *SettingsProviderFallbackPayload          `json:"fallback,omitzero"`
 }

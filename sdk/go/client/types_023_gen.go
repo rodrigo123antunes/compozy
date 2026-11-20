@@ -2,7 +2,69 @@
 
 package client
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
+
+// SettingsProviderAuthStatusPayload is a daemon API value.
+type SettingsProviderAuthStatusPayload struct {
+	Mode        string                         `json:"mode"`
+	EnvPolicy   string                         `json:"env_policy"`
+	HomePolicy  string                         `json:"home_policy"`
+	State       string                         `json:"state"`
+	Code        string                         `json:"code,omitempty"`
+	Message     string                         `json:"message,omitempty"`
+	StatusCmd   string                         `json:"status_command,omitempty"`
+	Login       ProviderLoginDescriptorPayload `json:"login"`
+	LastProbeAt *time.Time                     `json:"last_probe_at,omitempty"`
+}
+
+// SettingsProviderCredentialSlotPayload is a daemon API value.
+type SettingsProviderCredentialSlotPayload struct {
+	Name      string `json:"name"`
+	TargetEnv string `json:"target_env"`
+	SecretRef string `json:"secret_ref"`
+	Kind      string `json:"kind,omitempty"`
+	Required  bool   `json:"required"`
+}
+
+// SettingsProviderCredentialStatusPayload is a daemon API value.
+type SettingsProviderCredentialStatusPayload struct {
+	Name      string `json:"name"`
+	TargetEnv string `json:"target_env"`
+	SecretRef string `json:"secret_ref"`
+	Kind      string `json:"kind,omitempty"`
+	Required  bool   `json:"required"`
+	Present   bool   `json:"present"`
+	Source    string `json:"source,omitempty"`
+}
+
+// SettingsProviderEnabledResponse is a daemon API value.
+type SettingsProviderEnabledResponse struct {
+	Provider SettingsProviderItemPayload `json:"provider"`
+	Apply    SettingsApplyResponse       `json:"apply"`
+}
+
+// SettingsProviderFallbackPayload is a daemon API value.
+type SettingsProviderFallbackPayload struct {
+	Source   SettingsSourceRefPayload        `json:"source"`
+	Settings SettingsProviderSettingsPayload `json:"settings"`
+}
+
+// SettingsProviderItemPayload is a daemon API value.
+type SettingsProviderItemPayload struct {
+	SessionEnvStatus []SettingsProviderCredentialStatusPayload `json:"session_env_status,omitempty"`
+	Name             string                                    `json:"name"`
+	Settings         SettingsProviderSettingsPayload           `json:"settings"`
+	RuntimeStrategy  ProviderRuntimeStrategy                   `json:"runtime_strategy,omitempty"`
+	Default          bool                                      `json:"default"`
+	CommandAvailable bool                                      `json:"command_available"`
+	Credentials      []SettingsProviderCredentialStatusPayload `json:"credentials,omitempty"`
+	AuthStatus       *SettingsProviderAuthStatusPayload        `json:"auth_status,omitzero"`
+	SourceMetadata   SettingsSourceMetadataPayload             `json:"source_metadata"`
+	Fallback         *SettingsProviderFallbackPayload          `json:"fallback,omitzero"`
+}
 
 // SettingsProviderModelPayload is a daemon API value.
 type SettingsProviderModelPayload struct {
@@ -386,65 +448,3 @@ type SettingsSkillsResponse struct {
 
 // SettingsSourceKind is a daemon API value.
 type SettingsSourceKind string
-
-// SettingsSourceMetadataPayload is a daemon API value.
-type SettingsSourceMetadataPayload struct {
-	EffectiveSource  SettingsSourceRefPayload   `json:"effective_source"`
-	ShadowedSources  []SettingsSourceRefPayload `json:"shadowed_sources,omitempty"`
-	AvailableTargets []SettingsWriteTargetKind  `json:"available_targets"`
-}
-
-// SettingsSourceRefPayload is a daemon API value.
-type SettingsSourceRefPayload struct {
-	Kind        SettingsSourceKind `json:"kind"`
-	Scope       SettingsScopeKind  `json:"scope"`
-	WorkspaceID string             `json:"workspace_id,omitempty"`
-	Profile     string             `json:"profile,omitempty"`
-	AgentName   string             `json:"agent_name,omitempty"`
-}
-
-// SettingsStreamTransport is a daemon API value.
-type SettingsStreamTransport string
-
-// SettingsTerminalPayload is a daemon API value.
-type SettingsTerminalPayload struct {
-	DefaultShell           string `json:"default_shell"`
-	ShellIntegration       bool   `json:"shell_integration"`
-	ScrollbackBytes        int    `json:"scrollback_bytes"`
-	DetachedTTL            string `json:"detached_ttl"`
-	ExitRetention          string `json:"exit_retention"`
-	Recording              bool   `json:"recording"`
-	RecordingRetentionDays int    `json:"recording_retention_days"`
-	MaxPerWorkspace        int    `json:"max_per_workspace"`
-	MaxPerDaemon           int    `json:"max_per_daemon"`
-	MaxSubscribers         int    `json:"max_subscribers"`
-}
-
-// SettingsTransportParityPayload is a daemon API value.
-type SettingsTransportParityPayload struct {
-	Known          bool `json:"known"`
-	SettingsHTTP   bool `json:"settings_http"`
-	SettingsUDS    bool `json:"settings_uds"`
-	ExtensionsHTTP bool `json:"extensions_http"`
-	ExtensionsUDS  bool `json:"extensions_uds"`
-}
-
-// SettingsUpdateActor is a daemon API value.
-type SettingsUpdateActor string
-
-// SettingsUpdateAppPayload is a daemon API value.
-type SettingsUpdateAppPayload struct {
-	Status         SettingsUpdateStatusKind `json:"status"`
-	Running        bool                     `json:"running"`
-	CurrentVersion string                   `json:"current_version"`
-	LatestVersion  string                   `json:"latest_version"`
-	ReleaseURL     string                   `json:"release_url"`
-	AttemptID      string                   `json:"attempt_id"`
-	LastError      string                   `json:"last_error"`
-	Message        string                   `json:"message"`
-}
-
-// SettingsUpdateApplyRequest is a daemon API value.
-type SettingsUpdateApplyRequest struct {
-	Targets []SettingsUpdateTarget `json:"targets"`
-}

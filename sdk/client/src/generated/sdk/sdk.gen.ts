@@ -987,6 +987,9 @@ import type {
   ListProviderUsageData,
   ListProviderUsageErrors,
   ListProviderUsageResponses,
+  ListRemovedBuiltinExtensionsData,
+  ListRemovedBuiltinExtensionsErrors,
+  ListRemovedBuiltinExtensionsResponses,
   ListResourcesByKindData,
   ListResourcesByKindErrors,
   ListResourcesByKindResponses,
@@ -1040,6 +1043,9 @@ import type {
   ListSessionProcessesResponses,
   ListSessionsData,
   ListSessionsErrors,
+  ListSessionSidesData,
+  ListSessionSidesErrors,
+  ListSessionSidesResponses,
   ListSessionsResponses,
   ListSessionSubagentsData,
   ListSessionSubagentsErrors,
@@ -1158,6 +1164,9 @@ import type {
   OpenCmdPaletteViewSessionData,
   OpenCmdPaletteViewSessionErrors,
   OpenCmdPaletteViewSessionResponses,
+  OpenSessionSideData,
+  OpenSessionSideErrors,
+  OpenSessionSideResponses,
   PatchLoopData,
   PatchLoopErrors,
   PatchLoopResponses,
@@ -1443,6 +1452,9 @@ import type {
   RespondLoopRequestData,
   RespondLoopRequestErrors,
   RespondLoopRequestResponses,
+  RestoreExtensionData,
+  RestoreExtensionErrors,
+  RestoreExtensionResponses,
   ResumeAgentInstanceData,
   ResumeAgentInstanceErrors,
   ResumeAgentInstanceResponses,
@@ -1542,6 +1554,9 @@ import type {
   SetSessionRuntimeData,
   SetSessionRuntimeErrors,
   SetSessionRuntimeResponses,
+  SetSettingsMCPServerEnabledData,
+  SetSettingsMCPServerEnabledErrors,
+  SetSettingsMCPServerEnabledResponses,
   SetSettingsProviderEnabledData,
   SetSettingsProviderEnabledErrors,
   SetSettingsProviderEnabledResponses,
@@ -4562,6 +4577,29 @@ export class extensions extends HeyApiClient {
   }
 
   /**
+   * List permanently removed built-in extensions
+   */
+  public listRemovedBuiltinExtensions<ThrowOnError extends boolean = true>(
+    options?: Options<ListRemovedBuiltinExtensionsData, ThrowOnError>
+  ): RequestResult<
+    ListRemovedBuiltinExtensionsResponses,
+    ListRemovedBuiltinExtensionsErrors,
+    ThrowOnError,
+    "data"
+  > {
+    return (options?.client ?? this.client).get<
+      ListRemovedBuiltinExtensionsResponses,
+      ListRemovedBuiltinExtensionsErrors,
+      ThrowOnError,
+      "data"
+    >({
+      responseStyle: "data",
+      url: "/api/extensions/removed-builtins",
+      ...options,
+    });
+  }
+
+  /**
    * Update installed extensions and report each outcome
    */
   public updateExtensions<ThrowOnError extends boolean = true>(
@@ -4797,6 +4835,24 @@ export class extensions extends HeyApiClient {
         "Content-Type": "application/json",
         ...options.headers,
       },
+    });
+  }
+
+  /**
+   * Restore one permanently removed built-in extension
+   */
+  public restoreExtension<ThrowOnError extends boolean = true>(
+    options: Options<RestoreExtensionData, ThrowOnError>
+  ): RequestResult<RestoreExtensionResponses, RestoreExtensionErrors, ThrowOnError, "data"> {
+    return (options.client ?? this.client).post<
+      RestoreExtensionResponses,
+      RestoreExtensionErrors,
+      ThrowOnError,
+      "data"
+    >({
+      responseStyle: "data",
+      url: "/api/extensions/{name}/restore",
+      ...options,
     });
   }
 
@@ -7087,6 +7143,33 @@ export class settings extends HeyApiClient {
   }
 
   /**
+   * Turn one scoped MCP server on or off
+   */
+  public setSettingsMCPServerEnabled<ThrowOnError extends boolean = true>(
+    options: Options<SetSettingsMCPServerEnabledData, ThrowOnError>
+  ): RequestResult<
+    SetSettingsMCPServerEnabledResponses,
+    SetSettingsMCPServerEnabledErrors,
+    ThrowOnError,
+    "data"
+  > {
+    return (options.client ?? this.client).put<
+      SetSettingsMCPServerEnabledResponses,
+      SetSettingsMCPServerEnabledErrors,
+      ThrowOnError,
+      "data"
+    >({
+      responseStyle: "data",
+      url: "/api/settings/mcp-servers/{name}/enabled",
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...options.headers,
+      },
+    });
+  }
+
+  /**
    * Read the observability settings section
    */
   public getSettingsObservability<ThrowOnError extends boolean = true>(
@@ -8682,7 +8765,7 @@ export class sessions extends HeyApiClient {
   }
 
   /**
-   * Set the manual session order in a folder or the workspace root
+   * Set the manual session order in a folder, the workspace root, or Pinned
    */
   public reorderSessions<ThrowOnError extends boolean = true>(
     options: Options<ReorderSessionsData, ThrowOnError>
@@ -9945,6 +10028,46 @@ export class sessions extends HeyApiClient {
     >({
       responseStyle: "data",
       url: "/api/workspaces/{workspace_id}/sessions/{session_id}/runtime",
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...options.headers,
+      },
+    });
+  }
+
+  /**
+   * List all side chats attached to a session, newest updated first
+   */
+  public listSessionSides<ThrowOnError extends boolean = true>(
+    options: Options<ListSessionSidesData, ThrowOnError>
+  ): RequestResult<ListSessionSidesResponses, ListSessionSidesErrors, ThrowOnError, "data"> {
+    return (options.client ?? this.client).get<
+      ListSessionSidesResponses,
+      ListSessionSidesErrors,
+      ThrowOnError,
+      "data"
+    >({
+      responseStyle: "data",
+      url: "/api/workspaces/{workspace_id}/sessions/{session_id}/sides",
+      ...options,
+    });
+  }
+
+  /**
+   * Open a side chat without changing its source session
+   */
+  public openSessionSide<ThrowOnError extends boolean = true>(
+    options: Options<OpenSessionSideData, ThrowOnError>
+  ): RequestResult<OpenSessionSideResponses, OpenSessionSideErrors, ThrowOnError, "data"> {
+    return (options.client ?? this.client).post<
+      OpenSessionSideResponses,
+      OpenSessionSideErrors,
+      ThrowOnError,
+      "data"
+    >({
+      responseStyle: "data",
+      url: "/api/workspaces/{workspace_id}/sessions/{session_id}/sides",
       ...options,
       headers: {
         "Content-Type": "application/json",

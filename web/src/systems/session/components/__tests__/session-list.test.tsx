@@ -58,7 +58,8 @@ import type { SessionPayload, WorkspacePlacementPayload } from "../../types";
 import { useSessionSubagentBranch } from "../../hooks/use-session-subagent-branch";
 import { useSubagentRoster } from "../../hooks/use-subagent-roster";
 import { sessionKeys } from "../../lib/query-keys";
-import { SubagentDrawerContext, subagentDrawerLogic } from "../../contexts/subagent-drawer-context";
+import { SubagentDrawerContext } from "../../contexts/subagent-drawer-context";
+import { sessionWindowDrawerLogic } from "../../contexts/session-window-drawer-store";
 import { sessionParentPickerStore } from "../../hooks/use-session-parent-picker";
 import { sessionScopedDetailOptions, sessionTranscriptOptions } from "../../lib/query-options";
 import { preloadSessionEntry } from "../../lib/session-entry-preload";
@@ -988,6 +989,28 @@ describe("SessionList subagents", () => {
 
     expect(screen.queryByTestId("session-sidebar-session-one-child")).toBeNull();
     expect(screen.getByTestId("session-sidebar-session-two-child")).toBeVisible();
+  });
+
+  // Invariant (#1846): Expand groups folds child session lists like Collapse all, opens no
+  // subagent list, keeps a thread opened by hand open, and never hides a search result.
+  it("Should fold child sessions and leave subagents closed under Expand groups", () => {
+    vi.mocked(globalThis.fetch).mockImplementation(async () => subagentPage(0, 1));
+    const sessions = [
+      row("solo", summary(0, 1)),
+      row("one", {}),
+      row("one-child", { lineage: lineage("one") }),
+      row("two", {}),
+      row("two-child", { lineage: lineage("two") }),
+    ];
+    const grouped = { ...view, foldAll: "groups" as const, openThreadIds: ["two"] };
+    const list = renderList({ sessions, view: grouped });
+
+    expect(screen.queryByTestId("session-sidebar-session-one-child")).toBeNull();
+    expect(screen.getByTestId("session-sidebar-session-two-child")).toBeVisible();
+    expect(screen.queryByTestId("session-sidebar-subagents-solo")).toBeNull();
+
+    list.update(sessions, { ...grouped, search: "one" });
+    expect(screen.getByTestId("session-sidebar-session-one-child")).toBeVisible();
   });
 
   // Invariant (#1132): Collapse all never hides a search result behind its parent's fold.
@@ -1932,7 +1955,7 @@ describe("SessionList subagents", () => {
     async ({ id, workspaceId, closes }) => {
       const user = userEvent.setup();
       let rows = [wireSubagent(1, "running")];
-      const drawerStore = subagentDrawerLogic.createStore();
+      const drawerStore = sessionWindowDrawerLogic.createStore();
       const selectedSubagent = { ...subagentViewFromPayload(rows[0]!), id };
       drawerStore.trigger.opened({ subagent: selectedSubagent, workspaceId, trigger: null });
       const fetcher = vi.fn(async (input: RequestInfo | URL) => {
@@ -2294,11 +2317,12 @@ describe("SessionList Pinned", () => {
     ).toBeVisible();
     expect(screen.queryByText(/^No sessions/)).not.toBeInTheDocument();
 
-    // The count names pins, not threads: a pinned child nests under its pinned parent.
+    // A pin carries its subtree: the child nests under its pin and the count names pins only.
     const pinnedChild: SessionPayload = {
       ...pinned,
       id: "pinned-child",
       name: "Launch copy",
+      pinned_at: null,
       lineage: {
         spawn_role: "worker",
         parent_session_id: pinned.id,
@@ -2311,7 +2335,12 @@ describe("SessionList Pinned", () => {
       },
     };
     update([], { ...view, pinned: pinnedRead([pinned, pinnedChild]) });
-    expect(screen.getByTestId("session-sidebar-pinned-toggle")).toHaveTextContent("Pinned2");
+    expect(screen.getByTestId("session-sidebar-pinned-toggle")).toHaveTextContent("Pinned1");
+    expect(
+      within(screen.getByTestId("session-sidebar-pinned")).getByTestId(
+        "session-sidebar-session-pinned-child"
+      )
+    ).toBeVisible();
 
     // While the pins are still being read, the list below is not declared empty yet.
     const settled = { ...view, catalog: sessionListCatalogFixture() };
@@ -2345,6 +2374,74 @@ describe("SessionList Pinned", () => {
       path: `/api/workspaces/${pinned.workspace_id}/sessions/pinned/pin?profile=${pinned.profile_name}`,
     });
     await waitFor(() => expect(screen.getByText("Unpinned Launch plan.")).toBeInTheDocument());
+  });
+
+  // Invariant (#1859): pins reorder by Move up and Move down where the list reads one pair; the
+  // rows a pin carries take no order verbs, and a search turns the verbs off.
+  it("Should reorder pins from the row menu and leave carried rows unordered", async () => {
+    const user = userEvent.setup();
+    const reorder = vi.fn();
+    const second: SessionPayload = { ...pinned, id: "pinned-2", name: "Release notes" };
+    const carried: SessionPayload = {
+      ...pinned,
+      id: "carried",
+      name: "Notes draft",
+      pinned_at: null,
+      lineage: {
+        spawn_role: "worker",
+        parent_session_id: second.id,
+        root_session_id: second.id,
+        spawn_depth: 1,
+        auto_stop_on_parent: false,
+        notify_creator: false,
+        spawn_budget: { max_children: 0, max_depth: 0, ttl_seconds: 0 },
+        permission_policy: { tools: [], skills: [], mcp_servers: [], workspace_paths: [] },
+      },
+    };
+    // A carried row whose pin is outside this read (archived, filtered) stands as a root but is
+    // no pin, so it never joins the order the section sends.
+    const orphan: SessionPayload = {
+      ...carried,
+      id: "orphan",
+      name: "Stray worker",
+      lineage: { ...carried.lineage!, parent_session_id: "gone", root_session_id: "gone" },
+    };
+    const { update } = renderList({
+      sessions: [],
+      view: { ...view, pinned: { ...pinnedRead([pinned, second, carried, orphan]), reorder } },
+    });
+
+    await user.click(screen.getByTestId("session-row-actions-pinned-2"));
+    await openSubmenu(user, await screen.findByTestId("session-row-move-pinned-2"));
+    await chooseItem(user, await screen.findByTestId("session-row-up-pinned-2"));
+    expect(reorder).toHaveBeenCalledExactlyOnceWith(["pinned-2", "pinned"]);
+
+    // Dragging a pin past another reorders them; a carried row is no drag source.
+    reorder.mockClear();
+    const row = (id: string) => screen.getByTestId(`session-sidebar-session-${id}`).parentElement!;
+    for (const id of ["carried", "orphan"]) {
+      fireEvent.dragStart(row(id));
+      fireEvent.dragOver(row("pinned"));
+      fireEvent.drop(row("pinned"));
+    }
+    expect(reorder).not.toHaveBeenCalled();
+    fireEvent.dragStart(row("pinned"));
+    fireEvent.dragOver(row("pinned-2"));
+    fireEvent.drop(row("pinned-2"));
+    expect(reorder).toHaveBeenCalledExactlyOnceWith(["pinned-2", "pinned"]);
+
+    // A search can list a carried row as a root, so the section stops reordering meanwhile.
+    reorder.mockClear();
+    update([], {
+      ...view,
+      search: "notes",
+      setSearch: vi.fn(),
+      pinned: { ...pinnedRead([pinned, second]), reorder },
+    });
+    fireEvent.dragStart(row("pinned"));
+    fireEvent.dragOver(row("pinned-2"));
+    fireEvent.drop(row("pinned-2"));
+    expect(reorder).not.toHaveBeenCalled();
   });
 
   it("Should offer no pin verb on a subagent row", async () => {
@@ -3911,17 +4008,60 @@ describe("SessionList breadth and Group by", () => {
     expect(setGroupBy).toHaveBeenCalledWith("project");
   });
 
-  // #1132: the toolbar button's name says what a click will do, and it reports the opposite state.
+  // #1846: the toolbar's fold control is a menu; its name and checked item say the current depth.
   it.each([
-    { foldAll: null, label: "Collapse all", next: "collapsed" },
-    { foldAll: "expanded", label: "Collapse all", next: "collapsed" },
-    { foldAll: "collapsed", label: "Expand all", next: "expanded" },
-  ] as const)("Should offer $label while foldAll is $foldAll", async ({ foldAll, label, next }) => {
+    { foldAll: null, name: "Expand or collapse", checked: "nothing", pick: "Expand groups" },
+    { foldAll: "groups", name: "Groups expanded", checked: "Expand groups", pick: "Expand all" },
+    { foldAll: "expanded", name: "All expanded", checked: "Expand all", pick: "Collapse all" },
+    { foldAll: "collapsed", name: "All collapsed", checked: "Collapse all", pick: "Expand groups" },
+  ] as const)(
+    "Should mark $checked and offer every depth while foldAll is $foldAll",
+    async ({ foldAll, name, checked, pick }) => {
+      const user = userEvent.setup();
+      const setFoldAll = vi.fn();
+      renderList({ view: { ...view, foldAll, setFoldAll } });
+      await user.click(screen.getByRole("button", { name }));
+      const items = await screen.findAllByRole("menuitemradio");
+      expect(items.map(item => item.textContent)).toEqual([
+        "Expand groups",
+        "Expand all",
+        "Collapse all",
+      ]);
+      expect(
+        items.filter(item => item.getAttribute("aria-checked") === "true").map(i => i.textContent)
+      ).toEqual(checked === "nothing" ? [] : [checked]);
+      await user.click(screen.getByRole("menuitemradio", { name: pick }));
+      expect(setFoldAll).toHaveBeenCalledWith(
+        { "Expand groups": "groups", "Expand all": "expanded", "Collapse all": "collapsed" }[pick]
+      );
+    }
+  );
+
+  // #1846: the fold menu works from the keyboard alone.
+  it("Should open the fold menu with Enter or Space, move with arrows, pick with Enter and close on Escape", async () => {
     const user = userEvent.setup();
     const setFoldAll = vi.fn();
-    renderList({ view: { ...view, foldAll, setFoldAll } });
-    await user.click(screen.getByRole("button", { name: label }));
-    expect(setFoldAll).toHaveBeenCalledWith(next);
+    renderList({ view: { ...view, foldAll: "collapsed", setFoldAll } });
+    const trigger = screen.getByRole("button", { name: "All collapsed" });
+    act(() => trigger.focus());
+    await user.keyboard("{Enter}");
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(setFoldAll).not.toHaveBeenCalled();
+
+    await user.keyboard(" ");
+    await screen.findByRole("menu");
+    await waitFor(() =>
+      expect(screen.getByRole("menuitemradio", { name: "Expand groups" })).toHaveFocus()
+    );
+    await user.keyboard("{ArrowDown}");
+    expect(screen.getByRole("menuitemradio", { name: "Expand all" })).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(setFoldAll).toHaveBeenCalledWith("expanded");
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    await waitFor(() => expect(trigger).toHaveFocus());
   });
 
   // The filter belongs to the board: the List has no such control, and showing children marks

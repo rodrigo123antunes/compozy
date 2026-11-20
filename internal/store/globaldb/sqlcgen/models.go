@@ -563,6 +563,12 @@ type Extension struct {
 	GatewayConfirmedAt       sql.NullString `json:"gateway_confirmed_at"`
 }
 
+type ExtensionBuiltinTombstone struct {
+	Name      string `json:"name"`
+	RemovedAt string `json:"removed_at"`
+	RemovedBy string `json:"removed_by"`
+}
+
 type ExtensionDevLink struct {
 	ExtensionName            string         `json:"extension_name"`
 	WorkspaceID              string         `json:"workspace_id"`
@@ -619,6 +625,7 @@ type ExtensionMcpOverride struct {
 	HeadersJson string `json:"headers_json"`
 	Url         string `json:"url"`
 	UpdatedAt   string `json:"updated_at"`
+	Disabled    bool   `json:"disabled"`
 }
 
 type ExtensionProfileEnablement struct {
@@ -1672,6 +1679,7 @@ type Session struct {
 	InitiatorID              string         `json:"initiator_id"`
 	FailureSeenAt            sql.NullString `json:"failure_seen_at"`
 	PinnedAt                 sql.NullString `json:"pinned_at"`
+	PinPosition              sql.NullInt64  `json:"pin_position"`
 }
 
 type SessionCreationProfile struct {

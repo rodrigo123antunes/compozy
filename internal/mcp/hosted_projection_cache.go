@@ -40,6 +40,7 @@ type hostedProjectionFlightKey struct {
 type hostedProjectionFlight struct {
 	done     chan struct{}
 	response HostedProjectionResponse
+	previous HostedProjectionResponse
 	err      error
 	retry    bool
 }
@@ -60,6 +61,14 @@ func (s *HostedService) projectionForGeneration(
 	registry tools.Registry,
 	unversioned hostedProjectionBuilder,
 ) (HostedProjectionResponse, error) {
+	if tools.IsHostedCatalogRead(ctx) {
+		return catalogProjectionWithRedactionCheck(ctx, registry, record, s.boundedUnversionedProjection)
+	}
+	if runtime, ok := registry.(*tools.RuntimeRegistry); ok {
+		if hostedCtx, cached := runtime.HostedProjectionContext(ctx); cached {
+			return catalogProjectionWithRedactionCheck(hostedCtx, registry, record, s.boundedUnversionedProjection)
+		}
+	}
 	if s.projectionGeneration == nil {
 		return projectionWithRedactionCheck(ctx, registry, record, unversioned)
 	}
@@ -103,6 +112,22 @@ func (s *HostedService) projectionForGeneration(
 	return projectionWithRedactionCheck(ctx, registry, record, buildHostedProjection)
 }
 
+// Cached catalogs normally validate once per secret revision; sustained churn checks the final views.
+func catalogProjectionWithRedactionCheck(
+	ctx context.Context, registry tools.Registry, record *hostedBindRecord, build hostedProjectionBuilder,
+) (HostedProjectionResponse, error) {
+	var response HostedProjectionResponse
+	for range hostedProjectionGenerationRetries {
+		revision := projectionRedactionRevision(registry)
+		built, err := build(ctx, registry, record)
+		if err != nil || revision == projectionRedactionRevision(registry) {
+			return built, err
+		}
+		response = built
+	}
+	return filterUnsafeMCPMetadata(response, record), nil
+}
+
 func projectionWithRedactionCheck(
 	ctx context.Context, registry tools.Registry, record *hostedBindRecord, build hostedProjectionBuilder,
 ) (HostedProjectionResponse, error) {
@@ -116,21 +141,30 @@ func projectionWithRedactionCheck(
 
 // A changing redaction registry can invalidate individual tools without blocking the whole bind.
 func filterUnsafeMCPMetadata(response HostedProjectionResponse, record *hostedBindRecord) HostedProjectionResponse {
-	snapshot := redact.RegisteredSecretSnapshot()
-	views := make([]tools.ToolView, 0, len(response.Tools))
+	encoded := make([][]byte, len(response.Tools))
 	for i := range response.Tools {
 		view := &response.Tools[i]
 		if view.Descriptor.Source.Kind == tools.SourceMCP {
-			raw, err := json.Marshal(view)
-			if err != nil {
-				continue
-			}
-			unsafe, err := snapshot.NeedsBinaryJSONRedaction(raw)
-			if err != nil || unsafe {
-				continue
+			if raw, err := json.Marshal(view); err == nil {
+				encoded[i] = raw
 			}
 		}
-		views = append(views, *view)
+	}
+	safe := make([]bool, len(response.Tools))
+	redact.WithCurrentSecretSnapshot(func(snapshot *redact.SecretSnapshot) {
+		for i, raw := range encoded {
+			if raw != nil {
+				unsafe, err := snapshot.NeedsBinaryJSONRedaction(raw)
+				safe[i] = err == nil && !unsafe
+			}
+		}
+	})
+	views := make([]tools.ToolView, 0, len(response.Tools))
+	for i := range response.Tools {
+		view := &response.Tools[i]
+		if view.Descriptor.Source.Kind != tools.SourceMCP || safe[i] {
+			views = append(views, *view)
+		}
 	}
 	if len(views) == len(response.Tools) {
 		return response
@@ -175,7 +209,6 @@ func buildHostedProjection(
 		ctx = tools.EnsureProjectionListings(ctx)
 		views, err = registry.List(ctx, record.scope())
 		if err == nil {
-			response = hostedProjectionResponse(views, record.digestMemo)
 			if advertised, ok := registry.(interface {
 				AdvertisedSessionProjection(context.Context, tools.Scope) ([]tools.ToolView, error)
 			}); ok {
@@ -191,8 +224,12 @@ func buildHostedProjection(
 							native = append(native, *view)
 						}
 					}
-					response = hostedProjectionResponse(append(native, catalogViews...), record.digestMemo)
+					views = native
+					views = append(views, catalogViews...)
 				}
+			}
+			if err == nil {
+				response = hostedProjectionResponse(views, record.digestMemo)
 			}
 		}
 	}, "operation", "hosted_mcp_projection", "session_id", record.sessionID)

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/compozy/compozy/internal/deadentity"
+	"github.com/compozy/compozy/internal/redact"
 	"github.com/compozy/compozy/internal/store"
 )
 
@@ -134,6 +136,55 @@ func TestShouldCanonicalizeMCPToolIDs(t *testing.T) {
 
 func TestMCPProviderProjectionGeneration(t *testing.T) {
 	t.Parallel()
+
+	// Invariant: redaction changes keep safe descriptors and withhold only newly unsafe metadata.
+	// Owner: MCP provider discovery publication; canonical suite: MCP provider projection generations.
+	for _, scenario := range []struct {
+		name    string
+		related bool
+		want    []ToolID
+	}{
+		{"Should keep the catalog across an unrelated redaction change", false, []ToolID{"mcp__linear__safe", "mcp__linear__marked"}},
+		{"Should keep safe descriptors during a related redaction change", true, []ToolID{"mcp__linear__safe"}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			marker := fmt.Sprintf("catalog-publication-private-fixture-7c34-%t", scenario.related)
+			source := SourceRef{Kind: SourceMCP, Owner: "linear", RawServerName: "linear", Scope: mcpSourceScopeUser}
+			raw := []MCPToolDescriptor{
+				{RawName: "safe", InputSchema: json.RawMessage(`{"type":"object"}`)},
+				{RawName: "marked", Description: marker, InputSchema: json.RawMessage(`{"type":"object"}`)},
+			}
+			catalog := mcpDiscoverySnapshot{source: source, raw: raw}
+			for _, input := range raw {
+				descriptor, err := mcpRegistryDescriptor(source, input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				catalog.descriptors = append(catalog.descriptors, descriptor)
+			}
+			before := redact.RegisteredSecretSnapshot()
+			secret := marker
+			if !scenario.related {
+				secret += "-outside-the-catalog"
+			}
+			t.Cleanup(redact.RegisterRequiredSecret(secret))
+			got := catalog.descriptorsAt(before)
+			ids := make([]ToolID, 0, len(got))
+			for _, descriptor := range got {
+				ids = append(ids, descriptor.ID)
+			}
+			if !slices.Equal(ids, scenario.want) {
+				t.Fatalf("published IDs = %v, want %v", ids, scenario.want)
+			}
+			if scenario.related {
+				next := catalog.currentDescriptors()
+				if len(next) != 2 || strings.Contains(next[1].Description, marker) {
+					t.Fatal("complete catalog was not available with its metadata redacted")
+				}
+			}
+		})
+	}
 
 	t.Run("Should change when source auth availability changes", func(t *testing.T) {
 		t.Parallel()
@@ -496,6 +547,44 @@ func TestShouldCallMCPProviderThroughRegistry(t *testing.T) {
 }
 
 func TestShouldRetainDeadMCPDescriptorsUntilOpportunisticRecovery(t *testing.T) {
+	// Invariant: health follows the logical server name even when its tool ID is canonicalized.
+	// Owner: MCP provider availability; canonical suite: retained discovery and recovery.
+	t.Run("Should report a failing named source alongside its retained descriptors", func(t *testing.T) {
+		t.Parallel()
+		source := SourceRef{Kind: SourceMCP, Owner: "fixture-server", RawServerName: "fixture-server"}
+		executor := newFakeMCPExecutor(
+			[]MCPToolDescriptor{{RawName: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+		)
+		provider, err := NewMCPProvider(
+			MCPSourceListerFunc(func(context.Context) ([]SourceRef, error) { return []SourceRef{source}, nil }),
+			executor, nil, WithMCPBackgroundDiscovery(nil, nil),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := provider.List(t.Context(), Scope{}); err != nil {
+			t.Fatal(err)
+		}
+		executor.setListError(NewToolError(
+			ErrorCodeTimedOut, "", "tools/list timed out", ErrToolTimedOut, ReasonCallTimedOut,
+		))
+		if err := provider.CheckMCPServer(t.Context(), Scope{}, source.Owner); err != nil {
+			t.Fatal(err)
+		}
+		ctx := WithCachedMCPProjection(t.Context())
+		handle, found, err := provider.Resolve(ctx, Scope{}, "mcp__fixture_server__lookup")
+		if err != nil || !found {
+			t.Fatalf("resolve previous descriptor found=%v, err=%v", found, err)
+		}
+		got := handle.Availability(ctx, Scope{})
+		if got.Executable || !slices.Contains(got.ReasonCodes, ReasonBackendUnhealthy) {
+			t.Fatalf("availability after failed check = %+v", got)
+		}
+		if reason := provider.CatalogDiscoveryReason(ctx, Scope{}, source.Owner); reason != "Tool discovery timed out" {
+			t.Fatalf("catalog diagnostic = %q, want discovery timeout", reason)
+		}
+	})
+
 	for _, tc := range []struct{ checkFails, checkFirst bool }{{false, false}, {true, false}, {false, true}} {
 		t.Run(
 			fmt.Sprintf("Should prioritize checks with failure=%v checkFirst=%v", tc.checkFails, tc.checkFirst),
@@ -1396,6 +1485,15 @@ func (e *projectionMCPExecutor) ProjectionGeneration(
 	return e.generation, e.known
 }
 
+type catalogRevisionMCPExecutor struct{ *fakeMCPExecutor }
+
+func (e *catalogRevisionMCPExecutor) CatalogContentRevision(context.Context, SourceRef) ([sha256.Size]byte, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	revision, err := FingerprintMCPToolDescriptors(e.tools)
+	return revision, err == nil
+}
+
 func newFakeMCPExecutor(tools []MCPToolDescriptor) *fakeMCPExecutor {
 	return &fakeMCPExecutor{
 		tools:  tools,
@@ -1605,6 +1703,98 @@ func (c *mcpReliabilityTestClock) Advance(delta time.Duration) {
 
 func TestMCPProjectionDiscoveryIsBounded(t *testing.T) {
 	t.Parallel()
+	// Invariant: only an authorized live bind creates demand, and shared demand produces one listing.
+	// Owner: MCP provider discovery; canonical suite: TestMCPProjectionDiscoveryIsBounded.
+	t.Run("Should discover only while an admitted session has an active bind", func(t *testing.T) {
+		t.Parallel()
+		source := SourceRef{
+			Kind: SourceMCP, Owner: "workspace-server", Scope: mcpSourceScopeWorkspace, WorkspaceID: "ws-a",
+		}
+		executor := newFakeMCPExecutor(nil)
+		provider, err := NewMCPProvider(MCPSourceListerFunc(func(context.Context) ([]SourceRef, error) {
+			return []SourceRef{source}, nil
+		}), executor, nil, WithMCPBackgroundDiscovery(nil, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		provider.SetHostedCatalogAuthority(
+			func(_ context.Context, scope Scope, sources []SourceRef) ([]SourceRef, error) {
+				if scope.SessionID == "denied" {
+					return nil, nil
+				}
+				return sources, nil
+			},
+		)
+		registry := newMCPRegistry(t, provider)
+		first := Scope{WorkspaceID: "ws-a", SessionID: "first"}
+		ctx, cached := registry.HostedProjectionContext(t.Context())
+		if !cached {
+			t.Fatal("expected a cache-only hosted read")
+		}
+		if _, err := provider.List(ctx, first); err != nil {
+			t.Fatal(err)
+		}
+		releaseDenied := registry.BindHostedCatalog(Scope{WorkspaceID: "ws-a", SessionID: "denied"})
+		defer releaseDenied()
+		provider.refreshCatalog(t.Context())
+		if got := len(executor.listedSources); got != 0 {
+			t.Fatalf("unbound read and denied bind produced %d upstream listings, want 0", got)
+		}
+
+		releaseFirst := registry.BindHostedCatalog(first)
+		releaseSecond := registry.BindHostedCatalog(Scope{WorkspaceID: "ws-a", SessionID: "second"})
+		defer releaseFirst()
+		defer releaseSecond()
+		provider.refreshCatalog(t.Context())
+		if got := len(executor.listedSources); got != 1 {
+			t.Fatalf("two authorized binds produced %d upstream listings, want 1", got)
+		}
+
+		releaseFirst()
+		provider.refreshCatalog(t.Context())
+		if got := len(executor.listedSources); got != 2 {
+			t.Fatalf("upstream listings with one remaining bind = %d, want 2 total", got)
+		}
+		releaseSecond()
+		provider.refreshCatalog(t.Context())
+		if got := len(executor.listedSources); got != 2 {
+			t.Fatalf("upstream listings after the last admitted bind ended = %d, want 2 total", got)
+		}
+	})
+
+	// Invariant: profiles refresh their own snapshot when the shared source contents change.
+	// Owner: MCP provider discovery; canonical suite: TestMCPProjectionDiscoveryIsBounded.
+	t.Run("Should refresh both profiles of a shared declaration and reuse converged snapshots", func(t *testing.T) {
+		t.Parallel()
+		source := SourceRef{Kind: SourceMCP, Owner: "docs", Scope: mcpSourceScopeWorkspace, WorkspaceID: "ws-a"}
+		executor := &catalogRevisionMCPExecutor{newFakeMCPExecutor([]MCPToolDescriptor{{
+			RawName: "before", InputSchema: json.RawMessage(`{"type":"object"}`),
+		}})}
+		provider, err := NewMCPProvider(MCPSourceListerFunc(func(context.Context) ([]SourceRef, error) {
+			return []SourceRef{source}, nil
+		}), executor, nil, WithMCPBackgroundDiscovery(nil, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, peer := source, source
+		first.ProfileID, peer.ProfileID = "profile-a", "profile-b"
+		provider.refreshCatalogSource(t.Context(), first)
+		provider.refreshCatalogSource(t.Context(), peer)
+		executor.tools[0].RawName = "after"
+		provider.refreshCatalogSource(t.Context(), first)
+		provider.refreshCatalogSource(t.Context(), peer)
+		for _, profile := range []SourceRef{first, peer} {
+			views := provider.cachedSourceDescriptors(profile)
+			if len(views) != 1 || views[0].ID != "mcp__docs__after" {
+				t.Fatalf("profile %q snapshot=%+v, want changed catalog", profile.ProfileID, views)
+			}
+			provider.refreshCatalogSource(t.Context(), profile)
+		}
+		if got := len(executor.listedSources); got != 4 {
+			t.Fatalf("provider listing reads=%d, want 2 initial and 2 after the revision", got)
+		}
+	})
+
 	t.Run("Should omit a stalled source within budget and still discover healthy sources", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {

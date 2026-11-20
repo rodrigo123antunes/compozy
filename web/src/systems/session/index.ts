@@ -241,17 +241,13 @@ export {
   SessionTransportHistoryResetNotice,
 } from "./components/session-transport-notices";
 export { sessionKeys } from "./lib/query-keys";
+export { sessionLaunchPreviewOptions } from "./lib/session-catalog-options";
 export {
   cachedForeignSessionOwner,
   resolveForeignSessionOwner,
   resolveSessionOwner,
   sessionOwnerDialogState,
 } from "./lib/session-owner-resolution";
-export {
-  sessionOwnerKeys,
-  sessionOwnerOptions,
-  type SessionOwnerDialogState,
-} from "./lib/query-options";
 export { fetchSessionOwner } from "./adapters/session-owner-api";
 export {
   SESSION_WORKSPACE_SWITCH_STATES,
@@ -260,6 +256,9 @@ export {
   type SessionWorkspaceSwitchState,
 } from "./lib/session-deeplink-search";
 export {
+  sessionOwnerKeys,
+  sessionOwnerOptions,
+  type SessionOwnerDialogState,
   sessionClarificationsOptions,
   sessionCommandsOptions,
   sessionExpiredInteractionsOptions,
@@ -412,6 +411,7 @@ export { SessionSidebar, type SessionSidebarProps } from "./components/session-s
 export { SessionSidebarLayout } from "./components/session-sidebar-layout";
 export { sessionThreadFolds } from "./lib/session-sidebar-scope";
 export { walkSessionList } from "./lib/session-list-stops";
+export * from "./composer-focus";
 export {
   buildSessionTree,
   childSessionSignalState,
@@ -484,7 +484,6 @@ export * from "./hooks";
 // Context surface — context meter, usage turns, and activity (./context).
 export * from "./context";
 
-export { SessionComposerSubagents } from "./components/session-composer-subagents";
 export { SessionComposerMonitors } from "./components/session-composer-monitors";
 export { SessionComposerMCP } from "./components/session-composer-mcp";
 
@@ -492,6 +491,7 @@ export { SessionDraftRuntimeProvider } from "./contexts/session-draft-runtime-pr
 export { SessionPromptRuntimeContext } from "./contexts/session-prompt-runtime-context-value";
 export type { SessionThreadBranchChange, SessionThreadSegment } from "./lib/session-thread-branch";
 export * from "./subagents";
+export * from "./side-chat";
 // Processes surface — what a session left running and the stop/keep choice (./processes).
 export * from "./processes";
 export * from "./board-drawer";

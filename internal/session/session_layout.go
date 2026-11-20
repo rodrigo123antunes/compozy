@@ -105,6 +105,9 @@ func (m *Manager) MoveSession(
 	sessionID string,
 	folderID string,
 ) error {
+	if err := m.refuseSideOperation(ctx, sessionID, ErrSideFixedParent); err != nil {
+		return err
+	}
 	layout, err := m.sessionLayoutStore()
 	if err != nil {
 		return err
@@ -123,11 +126,39 @@ func (m *Manager) ReorderSessions(
 	folderID string,
 	sessionIDs []string,
 ) error {
+	for _, id := range sessionIDs {
+		if err := m.refuseSideOperation(ctx, id, ErrSideFixedParent); err != nil {
+			return err
+		}
+	}
 	layout, err := m.sessionLayoutStore()
 	if err != nil {
 		return err
 	}
 	if err := layout.ReorderSessions(ctx, scope, folderID, sessionIDs); err != nil {
+		return err
+	}
+	m.publishSessionLayoutChanged(scope)
+	return nil
+}
+
+// ReorderPinnedSessions orders the Pinned section: the listed pins of one layout scope take the
+// Pinned slots they hold now, in the listed order, and other pins keep theirs.
+func (m *Manager) ReorderPinnedSessions(
+	ctx context.Context,
+	scope store.SessionLayoutScope,
+	sessionIDs []string,
+) error {
+	for _, id := range sessionIDs {
+		if err := m.refuseSideOperation(ctx, id, ErrSideFixedParent); err != nil {
+			return err
+		}
+	}
+	pinStore, err := m.pinStore()
+	if err != nil {
+		return err
+	}
+	if err := pinStore.ReorderPinnedSessions(ctx, scope, sessionIDs); err != nil {
 		return err
 	}
 	m.publishSessionLayoutChanged(scope)

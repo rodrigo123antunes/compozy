@@ -98,6 +98,7 @@ type Info struct {
 	// Derivation is present only on continued or forked children.
 	Derivation             *store.SessionDerivation
 	State                  State
+	Prompting              bool
 	PendingPermission      bool
 	StopReason             store.StopReason
 	StopCause              StopCause
@@ -129,6 +130,8 @@ type Info struct {
 	ArchivedAt          *time.Time
 	// PinnedAt is when the operator pinned the session above the session list; nil when unpinned.
 	PinnedAt *time.Time
+	// PinScope places a session a pin carries in the Pinned section; only pinned reads decorate it.
+	PinScope *store.SessionPinScope
 	// Later is the parked state of a stopped session; nil when it is not parked.
 	Later *store.SessionLater
 	// LaterReturnedAt marks a session brought back from Later until the operator sees or resumes it.

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 )
 
 type registryTestProvider struct {
@@ -446,13 +447,54 @@ func TestRuntimeRegistryIndexingAndCollisions(t *testing.T) {
 }
 
 func TestRuntimeRegistryProjections(t *testing.T) {
+	// Invariant: slow projection work cannot block other keys, and a shared wait is cancelable.
+	// Owner: registry projection memoization; canonical suite: TestRuntimeRegistryProjections.
+	t.Run("Should isolate in-flight projection builds by key", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			cache := &projectionMemo[string, string]{}
+			build := func() (string, bool, error) { return "cached", true, nil }
+			if _, err := cache.load(t.Context(), "peer", build); err != nil {
+				t.Fatal(err)
+			}
+			release := make(chan struct{})
+			built := make(chan error, 1)
+			go func() {
+				_, err := cache.load(t.Context(), "slow", func() (string, bool, error) {
+					<-release
+					return "slow result", true, nil
+				})
+				built <- err
+			}()
+			synctest.Wait()
+
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			if got, err := cache.load(ctx, "peer", build); err != nil || got != "cached" {
+				t.Errorf("peer result = %q, %v", got, err)
+			}
+			if _, err := cache.load(ctx, "slow", build); !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("same-key wait error = %v, want deadline", err)
+			}
+			close(release)
+			if err := <-built; err != nil {
+				t.Fatal(err)
+			}
+			if got, err := cache.load(t.Context(), "slow", build); err != nil || got != "slow result" {
+				t.Fatalf("shared result = %q, %v", got, err)
+			}
+		})
+	})
+
 	t.Run("Should retain conflicts after native availability was classified in the same read", func(t *testing.T) {
 		t.Parallel()
 		descriptor := validDescriptor()
 		native, err := NewNativeProvider(descriptor.Source, NativeTool{
-			Descriptor:   descriptor,
-			Call:         func(context.Context, Scope, CallRequest) (ToolResult, error) { return ToolResult{}, nil },
-			Availability: func(context.Context, Scope) Availability { return Available() },
+			Descriptor: descriptor,
+			Call:       func(context.Context, Scope, CallRequest) (ToolResult, error) { return ToolResult{}, nil },
+			Availability: &NativeAvailabilityGroup{
+				Check: func(context.Context, Scope) Availability { return Available() },
+			},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -502,13 +544,13 @@ func TestRuntimeRegistryProjections(t *testing.T) {
 		provider, err := NewNativeProvider(descriptor.Source, NativeTool{
 			Descriptor: descriptor,
 			Call:       func(context.Context, Scope, CallRequest) (ToolResult, error) { return ToolResult{}, nil },
-			Availability: func(context.Context, Scope) Availability {
+			Availability: &NativeAvailabilityGroup{Check: func(context.Context, Scope) Availability {
 				calls++
 				if calls == 1 {
 					return Available()
 				}
 				return Unavailable(ReasonDependencyMissing)
-			},
+			}},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -954,10 +996,10 @@ func TestRuntimeRegistryProjections(t *testing.T) {
 		probes := 0
 		provider, err := NewNativeProvider(descriptor.Source, NativeTool{
 			Descriptor: descriptor,
-			Availability: func(context.Context, Scope) Availability {
+			Availability: &NativeAvailabilityGroup{Check: func(context.Context, Scope) Availability {
 				probes++
 				return Unavailable(ReasonBackendUnhealthy)
-			},
+			}},
 			Call: func(context.Context, Scope, CallRequest) (ToolResult, error) {
 				return ToolResult{}, nil
 			},
@@ -1373,6 +1415,42 @@ func TestRuntimeRegistrySearchGetAndCustomEvaluator(t *testing.T) {
 		}
 		_, err = registry.DiagnosticGet(ctx, Scope{}, "compozy__missing")
 		requireReason(t, err, ReasonToolUnknown)
+	})
+
+	t.Run("Should rank multi-word identity matches before legacy description matches", func(t *testing.T) {
+		t.Parallel()
+		legacy := validDescriptor()
+		legacy.ID = "compozy__a_legacy"
+		legacy.Description = "Docs for Slack send workflows."
+		send := mcpDescriptor("mcp__slack__send_message", "slack", "send_message")
+		read := mcpDescriptor("mcp__slack__read_message", "slack", "read_message")
+		registry, err := NewRegistry(
+			WithProviders(
+				providerWithDescriptors(legacy.Source, legacy),
+				providerWithDescriptors(send.Source, read, send),
+			),
+			WithPolicyEvaluator(staticPolicyEvaluator{decision: EffectiveToolDecision{
+				VisibleToOperator: true, VisibleToSession: true, Callable: true,
+			}}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, search := range []func(context.Context, Scope, SearchQuery) ([]ToolView, error){
+			registry.Search, registry.DiagnosticSearch,
+		} {
+			results, err := search(t.Context(), Scope{}, SearchQuery{Query: " SlaCK  send "})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(results) != 2 || results[0].Descriptor.ID != send.ID || results[1].Descriptor.ID != legacy.ID {
+				t.Fatalf("ranked matches = %+v, want %s then %s", results, send.ID, legacy.ID)
+			}
+			results, err = search(t.Context(), Scope{}, SearchQuery{Query: "Slack send", Limit: 1})
+			if err != nil || len(results) != 1 || results[0].Descriptor.ID != send.ID {
+				t.Fatalf("ranked and limited matches = %+v, error = %v", results, err)
+			}
+		}
 	})
 }
 

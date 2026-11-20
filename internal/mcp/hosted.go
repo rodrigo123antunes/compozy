@@ -131,6 +131,7 @@ type HostedProjectionResponse struct {
 
 // HostedCallRequest invokes one hosted MCP tool through the registry.
 type HostedCallRequest struct {
+	DiscoverTools bool            `json:"discover_tools,omitempty"`
 	BindID        string          `json:"bind_id"`
 	ToolName      string          `json:"tool_name"`
 	ToolCallID    string          `json:"tool_call_id,omitempty"`
@@ -140,7 +141,8 @@ type HostedCallRequest struct {
 
 // HostedCallResponse carries the canonical registry result envelope.
 type HostedCallResponse struct {
-	Result tools.ToolResult `json:"result"`
+	Result            tools.ToolResult `json:"result"`
+	DiscoveredToolIDs []tools.ToolID   `json:"discovered_tool_ids,omitempty"`
 }
 
 // HostedReleaseRequest releases one active bind record.
@@ -179,6 +181,7 @@ type hostedBindRecord struct {
 	initialDeadline   time.Time
 	eagerTools        bool
 	digestMemo        *hostedProjectionDigestMemo
+	releaseCatalog    func()
 	bindID            string
 	sessionID         string
 	profileID         string
@@ -274,7 +277,7 @@ func (s *HostedService) Launch(ctx context.Context, req HostedLaunchRequest) (co
 	releasedBindIDs := make([]string, 0)
 	for bindID, bind := range s.binds {
 		if bind != nil && bind.sessionID == sessionID {
-			delete(s.binds, bindID)
+			s.removeBindLocked(bindID)
 			releasedBindIDs = append(releasedBindIDs, bindID)
 		}
 	}
@@ -376,7 +379,7 @@ func (s *HostedService) ReleaseSession(sessionID string) {
 	releasedBindIDs := make([]string, 0)
 	for bindID, record := range s.binds {
 		if record.sessionID == sessionID {
-			delete(s.binds, bindID)
+			s.removeBindLocked(bindID)
 			releasedBindIDs = append(releasedBindIDs, bindID)
 		}
 	}

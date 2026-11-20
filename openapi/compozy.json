@@ -9488,6 +9488,39 @@
         ],
         "type": "object"
       },
+      "ExtensionRemovedBuiltinPayload": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "removed_at": {
+            "type": "string"
+          },
+          "removed_by": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "removed_at",
+          "removed_by"
+        ],
+        "type": "object"
+      },
+      "ExtensionRemovedBuiltinsResponse": {
+        "properties": {
+          "removed": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionRemovedBuiltinPayload"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "removed"
+        ],
+        "type": "object"
+      },
       "ExtensionResponse": {
         "properties": {
           "extension": {
@@ -9496,6 +9529,37 @@
         },
         "required": [
           "extension"
+        ],
+        "type": "object"
+      },
+      "ExtensionRestorePayload": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "name",
+          "path",
+          "source",
+          "status",
+          "version"
         ],
         "type": "object"
       },
@@ -18656,10 +18720,16 @@
           "path": {
             "type": "string"
           },
+          "permanent": {
+            "type": "boolean"
+          },
           "quarantine_path": {
             "type": "string"
           },
           "status": {
+            "type": "string"
+          },
+          "tombstoned_at": {
             "type": "string"
           },
           "warnings": {
@@ -18672,7 +18742,9 @@
         "required": [
           "name",
           "path",
-          "status"
+          "permanent",
+          "status",
+          "tombstoned_at"
         ],
         "type": "object"
       },
@@ -20361,6 +20433,24 @@
         },
         "required": [
           "app"
+        ],
+        "type": "object"
+      },
+      "OpenSessionSideRequest": {
+        "properties": {
+          "idempotency_key": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "idempotency_key",
+          "message"
         ],
         "type": "object"
       },
@@ -23496,6 +23586,9 @@
           "folder_id": {
             "type": "string"
           },
+          "pinned": {
+            "type": "boolean"
+          },
           "session_ids": {
             "items": {
               "type": "string"
@@ -26072,6 +26165,19 @@
               }
             ]
           },
+          "side": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SessionSideCommandResult"
+              },
+              {
+                "enum": [
+                  null
+                ],
+                "nullable": true
+              }
+            ]
+          },
           "status": {
             "type": "string"
           },
@@ -26554,6 +26660,9 @@
           "kind": {
             "type": "string"
           },
+          "name": {
+            "type": "string"
+          },
           "profile_id": {
             "type": "string"
           },
@@ -26561,6 +26670,9 @@
             "type": "string"
           },
           "session_id": {
+            "type": "string"
+          },
+          "side_session_id": {
             "type": "string"
           },
           "workspace_id": {
@@ -27505,7 +27617,8 @@
               "spawn",
               "continue",
               "fork",
-              "recovery"
+              "recovery",
+              "side"
             ],
             "type": "string"
           },
@@ -28943,7 +29056,8 @@
               "spawn",
               "continue",
               "fork",
-              "recovery"
+              "recovery",
+              "side"
             ],
             "type": "string"
           },
@@ -30737,6 +30851,86 @@
           "last_attempt_at",
           "max_attempts",
           "started_at"
+        ],
+        "type": "object"
+      },
+      "SessionSideCommandResult": {
+        "properties": {
+          "seed": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "source_turn_in_progress": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "seed",
+          "session_id",
+          "source_turn_in_progress"
+        ],
+        "type": "object"
+      },
+      "SessionSideItemPayload": {
+        "properties": {
+          "archived_at": {
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pending_clarify_count": {
+            "type": "integer"
+          },
+          "pending_permission_count": {
+            "type": "integer"
+          },
+          "prompting": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "archived_at",
+          "created_at",
+          "id",
+          "name",
+          "pending_clarify_count",
+          "pending_permission_count",
+          "prompting",
+          "state",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "SessionSidesResponse": {
+        "properties": {
+          "sides": {
+            "items": {
+              "$ref": "#/components/schemas/SessionSideItemPayload"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sides"
         ],
         "type": "object"
       },
@@ -33257,6 +33451,17 @@
         },
         "type": "object"
       },
+      "SettingsMCPServerEnabledRequest": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
       "SettingsMCPServerItemPayload": {
         "properties": {
           "approval": {
@@ -33308,6 +33513,9 @@
           },
           "definition_source": {
             "type": "string"
+          },
+          "disabled": {
+            "type": "boolean"
           },
           "env_keys": {
             "items": {
@@ -64544,6 +64752,62 @@
         ]
       }
     },
+    "/api/extensions/removed-builtins": {
+      "get": {
+        "operationId": "listRemovedBuiltinExtensions",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionRemovedBuiltinsResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Listing is not available on this extension service"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Extension service is not configured"
+          }
+        },
+        "summary": "List permanently removed built-in extensions",
+        "tags": [
+          "extensions"
+        ],
+        "x-compozy-app-access": "denied",
+        "x-compozy-transports": [
+          "http",
+          "uds"
+        ]
+      }
+    },
     "/api/extensions/update": {
       "post": {
         "operationId": "updateExtensions",
@@ -64690,6 +64954,14 @@
             }
           },
           {
+            "description": "Remove a bundled built-in permanently. It is not re-enrolled at boot or update until restored. Global only.",
+            "in": "query",
+            "name": "permanent",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "description": "Act as this profile by name",
             "in": "query",
             "name": "profile",
@@ -64708,6 +64980,16 @@
               }
             },
             "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Invalid request, including permanent with a workspace or profile"
           },
           "403": {
             "content": {
@@ -64739,6 +65021,16 @@
             },
             "description": "Extension is in use"
           },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionOperationErrorPayload"
+                }
+              }
+            },
+            "description": "Extension is not a built-in"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -64748,6 +65040,16 @@
               }
             },
             "description": "Internal server error"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Permanent removal is not available on this extension service"
           },
           "503": {
             "content": {
@@ -65613,6 +65915,103 @@
           }
         },
         "summary": "Reload a workspace extension from an immutable generation",
+        "tags": [
+          "extensions"
+        ],
+        "x-compozy-app-access": "denied",
+        "x-compozy-transports": [
+          "http",
+          "uds"
+        ]
+      }
+    },
+    "/api/extensions/{name}/restore": {
+      "post": {
+        "operationId": "restoreExtension",
+        "parameters": [
+          {
+            "description": "Extension name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionRestorePayload"
+                }
+              }
+            },
+            "description": "Restored at the bundled version, enabled"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Extension not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionOperationErrorPayload"
+                }
+              }
+            },
+            "description": "Not permanently removed, or a non-bundled extension of the same name is installed"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionOperationErrorPayload"
+                }
+              }
+            },
+            "description": "Enrollment failed; the removed state is restored and the tombstone is kept"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Restore is not available on this extension service"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Extension service is not configured"
+          }
+        },
+        "summary": "Restore one permanently removed built-in extension",
         "tags": [
           "extensions"
         ],
@@ -75512,7 +75911,7 @@
             }
           },
           {
-            "description": "Visibility of pinned sessions; included by default",
+            "description": "Visibility of pinned sessions and the subtrees their pins carry; included by default",
             "in": "query",
             "name": "pinned",
             "schema": {
@@ -75525,7 +75924,7 @@
             }
           },
           {
-            "description": "Stable session ordering; pinned (pin order, oldest first) requires pinned=only",
+            "description": "Stable session ordering; pinned (the operator's Pinned order, pages by pin with each pin's subtree) requires pinned=only",
             "in": "query",
             "name": "sort",
             "schema": {
@@ -76097,7 +76496,7 @@
             }
           },
           {
-            "description": "Visibility of pinned sessions; included by default",
+            "description": "Visibility of pinned sessions and the subtrees their pins carry; included by default",
             "in": "query",
             "name": "pinned",
             "schema": {
@@ -80204,6 +80603,160 @@
           }
         },
         "summary": "Retry one scoped MCP server runtime probe",
+        "tags": [
+          "settings"
+        ],
+        "x-compozy-app-access": "denied",
+        "x-compozy-transports": [
+          "http",
+          "uds"
+        ]
+      }
+    },
+    "/api/settings/mcp-servers/{name}/enabled": {
+      "put": {
+        "operationId": "setSettingsMCPServerEnabled",
+        "parameters": [
+          {
+            "description": "Configured MCP server name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact MCP settings scope",
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "user",
+                "profile",
+                "workspace"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required when scope is workspace",
+            "in": "query",
+            "name": "workspace_id",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required when scope is profile",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Definition owner: manual or extension:\u003cname\u003e; omitted owner selects manual",
+            "in": "query",
+            "name": "owner",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Declaring file from the Settings MCP row. Selects one same-name definition in the requested scope.",
+            "in": "query",
+            "name": "definition_source",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsMCPServerEnabledRequest"
+              }
+            }
+          },
+          "description": "JSON request body",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsMCPServerResponse"
+                }
+              }
+            },
+            "description": "Updated server"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Invalid MCP server owner, scope, or payload"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "MCP server or workspace not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "MCP server definition is ambiguous or cannot be edited"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "MCP server state could not be applied"
+          }
+        },
+        "summary": "Turn one scoped MCP server on or off",
         "tags": [
           "settings"
         ],
@@ -98616,7 +99169,7 @@
             "description": "Session layout unavailable"
           }
         },
-        "summary": "Set the manual session order in a folder or the workspace root",
+        "summary": "Set the manual session order in a folder, the workspace root, or Pinned",
         "tags": [
           "sessions"
         ],
@@ -98869,7 +99422,7 @@
             }
           },
           {
-            "description": "Visibility of pinned sessions; included by default",
+            "description": "Visibility of pinned sessions and the subtrees their pins carry; included by default",
             "in": "query",
             "name": "pinned",
             "schema": {
@@ -98882,7 +99435,7 @@
             }
           },
           {
-            "description": "Stable session ordering; pinned (pin order, oldest first) requires pinned=only",
+            "description": "Stable session ordering; pinned (the operator's Pinned order, pages by pin with each pin's subtree) requires pinned=only",
             "in": "query",
             "name": "sort",
             "schema": {
@@ -105804,6 +106357,16 @@
               }
             }
           },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendPromptResultResponse"
+                }
+              }
+            },
+            "description": "Side chat opened"
+          },
           "202": {
             "content": {
               "application/json": {
@@ -105818,7 +106381,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorPayload"
+                  "$ref": "#/components/schemas/SessionDeriveErrorPayload"
                 }
               }
             },
@@ -105830,7 +106393,7 @@
                 "schema": {
                   "oneOf": [
                     {
-                      "$ref": "#/components/schemas/ErrorPayload"
+                      "$ref": "#/components/schemas/SessionDeriveErrorPayload"
                     },
                     {
                       "$ref": "#/components/schemas/SendPromptResultResponse"
@@ -105847,7 +106410,7 @@
                 "schema": {
                   "oneOf": [
                     {
-                      "$ref": "#/components/schemas/ErrorPayload"
+                      "$ref": "#/components/schemas/SessionDeriveErrorPayload"
                     },
                     {
                       "$ref": "#/components/schemas/SendPromptResultResponse"
@@ -105874,7 +106437,7 @@
                 "schema": {
                   "oneOf": [
                     {
-                      "$ref": "#/components/schemas/ErrorPayload"
+                      "$ref": "#/components/schemas/SessionDeriveErrorPayload"
                     },
                     {
                       "$ref": "#/components/schemas/SendPromptResultResponse"
@@ -105889,7 +106452,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorPayload"
+                  "$ref": "#/components/schemas/SessionDeriveErrorPayload"
                 }
               }
             },
@@ -105899,7 +106462,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorPayload"
+                  "$ref": "#/components/schemas/SessionDeriveErrorPayload"
                 }
               }
             },
@@ -107082,6 +107645,241 @@
           }
         },
         "summary": "Select the default runtime for future prompts",
+        "tags": [
+          "sessions"
+        ],
+        "x-compozy-app-access": "allowed",
+        "x-compozy-transports": [
+          "http",
+          "uds"
+        ]
+      }
+    },
+    "/api/workspaces/{workspace_id}/sessions/{session_id}/sides": {
+      "get": {
+        "operationId": "listSessionSides",
+        "parameters": [
+          {
+            "description": "Workspace id",
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Source session id",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include closed side chats",
+            "in": "query",
+            "name": "archived",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Act as this profile by name",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSidesResponse"
+                }
+              }
+            },
+            "description": "Complete side chat list"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Invalid archive filter"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Session not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Side chats cannot list nested side chats"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorPayload"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "List all side chats attached to a session, newest updated first",
+        "tags": [
+          "sessions"
+        ],
+        "x-compozy-app-access": "allowed",
+        "x-compozy-transports": [
+          "http",
+          "uds"
+        ]
+      },
+      "post": {
+        "operationId": "openSessionSide",
+        "parameters": [
+          {
+            "description": "Workspace id",
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Source session id",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Act as this profile by name",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenSessionSideRequest"
+              }
+            }
+          },
+          "description": "JSON request body",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDeriveResponse"
+                }
+              }
+            },
+            "description": "Recorded side chat replayed"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDeriveResponse"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDeriveErrorPayload"
+                }
+              }
+            },
+            "description": "Invalid side chat question or identity"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDeriveErrorPayload"
+                }
+              }
+            },
+            "description": "Session not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDeriveErrorPayload"
+                }
+              }
+            },
+            "description": "Side chat refused"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDeriveErrorPayload"
+                }
+              }
+            },
+            "description": "Runtime or authentication failure; when the new session was already created the error carries child_session_id and a retry with the same idempotency_key returns it"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDeriveErrorPayload"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDeriveErrorPayload"
+                }
+              }
+            },
+            "description": "New-work admission is unavailable while the daemon is draining"
+          }
+        },
+        "summary": "Open a side chat without changing its source session",
         "tags": [
           "sessions"
         ],

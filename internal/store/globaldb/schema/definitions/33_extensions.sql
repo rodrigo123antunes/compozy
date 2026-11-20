@@ -89,6 +89,7 @@ CREATE TABLE extension_mcp_overrides (
  headers_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(headers_json)),
  url TEXT NOT NULL DEFAULT '',
  updated_at TEXT NOT NULL,
+ disabled BOOLEAN NOT NULL DEFAULT FALSE CHECK (disabled IN (0, 1)),
  PRIMARY KEY (extension, profile, workspace_id, server),
  UNIQUE (profile, workspace_id, runtime_name)
 );
@@ -160,3 +161,11 @@ AFTER DELETE ON profiles
 BEGIN
  DELETE FROM extension_mcp_overrides WHERE profile = OLD.id;
 END;
+
+-- Permanently removed bundled names. Global, not per profile, like bundled rows. There is
+-- deliberately no foreign key to extensions: the tombstone must outlive the removed row.
+CREATE TABLE extension_builtin_tombstones (
+ name TEXT NOT NULL PRIMARY KEY CHECK (trim(name) <> ''),
+ removed_at TEXT NOT NULL,
+ removed_by TEXT NOT NULL
+);

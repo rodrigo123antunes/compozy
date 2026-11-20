@@ -51,6 +51,8 @@ var sessionTools = []toolspkg.Descriptor{
 	sessionRewindDescriptor(),
 	sessionContinueDescriptor(),
 	sessionForkDescriptor(),
+	sessionSideOpenDescriptor(),
+	sessionSideListDescriptor(),
 	sessionRuntimeSetDescriptor(),
 	sessionWorktreeBindingDescriptor(true),
 	sessionWorktreeBindingDescriptor(false),
@@ -288,7 +290,7 @@ const sessionListInputSchema = `{
 		"pinned":{
 			"type":"string",
 			"enum":["exclude","only","include"],
-			"description":"Visibility of sessions pinned above the session list; included by default. Sort pinned requires only."
+			"description":"Pinned sessions and their carried subtrees; included by default. Sort pinned requires only."
 		},
 		"include_health":{"type":"boolean"},
 		"sort":{"type":"string","enum":["recent","created","name","last_activity","attention","navigator","manual","pinned"]},
@@ -413,6 +415,9 @@ const sessionPromptOutputSchema = `{
  "reply_watch":{"type":"object","required":["id","state"],
  "properties":{"id":{"type":"string"},
  "state":{"type":"string","enum":["armed","fired","delivered","abandoned"]}},"additionalProperties":false},
+				"side":{"type":"object","required":["session_id","seed","source_turn_in_progress"],
+ "properties":{"session_id":{"type":"string"},"seed":{"type":"string","enum":["replay","native_fork"]},
+ "source_turn_in_progress":{"type":"boolean"}},"additionalProperties":false},
 				"goal":{"type":"object"}
 			},
 			"additionalProperties":false

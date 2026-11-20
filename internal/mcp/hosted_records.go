@@ -68,6 +68,16 @@ func (s *HostedService) bindLaunch(
 	return record.clone(), nil
 }
 
+// removeBindLocked releases its background discovery interest; callers hold s.mu.
+func (s *HostedService) removeBindLocked(bindID string) *hostedBindRecord {
+	record := s.binds[bindID]
+	delete(s.binds, bindID)
+	if record != nil && record.releaseCatalog != nil {
+		record.releaseCatalog()
+	}
+	return record
+}
+
 func (s *HostedService) recordForBind(
 	ctx context.Context,
 	bindID string,
@@ -91,8 +101,13 @@ func (s *HostedService) recordForBind(
 	if record == nil {
 		return nil, ErrHostedBindNotFound
 	}
-	if err := record.validatePeer(peer); err != nil {
+	if err := record.validatePeerCredentials(peer); err != nil {
 		return nil, err
+	}
+	if record.expectedBin != s.expectedBinary {
+		if err := record.validatePeerExecutable(peer); err != nil {
+			return nil, err
+		}
 	}
 	return record, nil
 }
@@ -210,13 +225,17 @@ func (r *hostedBindRecord) clone() *hostedBindRecord {
 	return new(*r)
 }
 
-func (r *hostedBindRecord) validatePeer(peer PeerInfo) error {
+func (r *hostedBindRecord) validatePeerCredentials(peer PeerInfo) error {
 	if r == nil {
 		return ErrHostedBindNotFound
 	}
 	if peer.PID != r.peer.PID || peer.UID != r.peer.UID || peer.UserSID != r.peer.UserSID {
 		return fmt.Errorf("%w: peer credential changed", ErrHostedPeerInvalid)
 	}
+	return nil
+}
+
+func (r *hostedBindRecord) validatePeerExecutable(peer PeerInfo) error {
 	matches, err := sameExecutablePath(r.expectedBin, peer.ExecutablePath)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrHostedBinaryInvalid, err)

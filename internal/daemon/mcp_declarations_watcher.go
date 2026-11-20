@@ -9,6 +9,7 @@ import (
 
 	compozyconfig "github.com/compozy/compozy/internal/config"
 	"github.com/compozy/compozy/internal/filesnap"
+	"github.com/compozy/compozy/internal/tools"
 )
 
 const mcpDeclarationWatcherLabel = "MCP declaration watcher"
@@ -87,6 +88,14 @@ func (d *Daemon) bootMCPDeclarationWatcher(ctx context.Context, state *bootState
 		syncer.declarationWatch = &watcher
 	}
 	interval := state.cfg.Skills.EffectivePollInterval()
+	if provider, ok := state.mcpToolProvider.(*tools.MCPProvider); ok {
+		if catalogComplete, admitted := worker.Begin(); admitted {
+			go func() {
+				defer catalogComplete()
+				provider.RunCatalogRefresh(workerCtx)
+			}()
+		}
+	}
 	if policyComplete, ok := worker.Begin(); ok {
 		go func() {
 			defer policyComplete()
@@ -108,7 +117,7 @@ func runMCPDeclarationWatcher(
 	delay := interval
 	refresh := func() {
 		if state.runtimeMCPInventory != nil {
-			state.runtimeMCPInventory.Poll()
+			state.runtimeMCPInventory.Poll(ctx)
 		}
 		if err := watcher.poll(ctx); err != nil && ctx.Err() == nil && state.logger != nil {
 			// Parsing errors can contain config values; keep the warning secret-free.

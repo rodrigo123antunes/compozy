@@ -289,6 +289,7 @@ func registerExtensionRoutes(api gin.IRouter, handlers *Handlers, localOnly bool
 	extensions := api.Group("/extensions")
 	extensions.GET("", handlers.ListExtensions)
 	extensions.GET("/search", handlers.SearchExtensions)
+	extensions.GET("/removed-builtins", handlers.ListRemovedBuiltinExtensions)
 	extensions.GET("/commands", handlers.ExtensionCommands)
 	extensions.POST("/preview-install", privileged, handlers.PreviewExtensionInstall)
 	extensions.POST("", privileged, handlers.InstallExtension)
@@ -303,6 +304,7 @@ func registerExtensionRoutes(api gin.IRouter, handlers *Handlers, localOnly bool
 	extensions.GET("/:name/inventory", handlers.ExtensionInventory)
 	extensions.GET("/:name", handlers.ExtensionStatus)
 	extensions.POST("/:name/reload", privileged, handlers.ReloadDevExtension)
+	extensions.POST("/:name/restore", privileged, handlers.RestoreExtension)
 	extensions.GET("/:name/logs", handlers.ExtensionLogs)
 	extensions.GET("/:name/enablement", handlers.ListExtensionEnablement)
 	extensions.PUT("/:name/enablement", profileWrite, handlers.SetExtensionEnablement)
@@ -355,7 +357,18 @@ func registerSettingsRoutes(api gin.IRouter, handlers *Handlers) {
 	settings.PUT("/providers/:name", privileged, handlers.PutSettingsProvider)
 	settings.DELETE("/providers/:name", privileged, handlers.DeleteSettingsProvider)
 	settings.PATCH("/providers/:name/enabled", privileged, handlers.SetSettingsProviderEnabled)
+	registerSettingsMCPRoutes(settings, handlers, privileged)
 
+	settings.GET("/hooks", handlers.ListSettingsHooks)
+	settings.PUT("/hooks/:name", privileged, handlers.PutSettingsHook)
+	settings.DELETE("/hooks/:name", privileged, handlers.DeleteSettingsHook)
+
+	actions := settings.Group("/actions")
+	actions.POST("/restart", privileged, handlers.TriggerSettingsRestart)
+	actions.GET("/restart/:operation_id", handlers.GetSettingsRestartStatus)
+}
+
+func registerSettingsMCPRoutes(settings gin.IRouter, handlers *Handlers, privileged gin.HandlerFunc) {
 	settings.GET("/runtime-mcp-servers", handlers.ListRuntimeMCPServers)
 	settings.POST("/runtime-mcp-servers/:runtime/:name/import", privileged, handlers.ImportRuntimeMCPServer)
 	settings.GET("/mcp-servers", handlers.ListSettingsMCPServers)
@@ -367,16 +380,9 @@ func registerSettingsRoutes(api gin.IRouter, handlers *Handlers) {
 	settings.POST("/mcp-servers/:name/auth/exchange", privileged, handlers.ExchangeSettingsMCPAuth)
 	settings.POST("/mcp-servers/:name/auth/logout", privileged, handlers.LogoutSettingsMCPAuth)
 	settings.POST("/mcp-servers/:name/check", privileged, handlers.CheckSettingsMCPServer)
+	settings.PUT("/mcp-servers/:name/enabled", privileged, handlers.SetSettingsMCPServerEnabled)
 	settings.PUT("/mcp-servers/:name", privileged, handlers.PutSettingsMCPServer)
 	settings.DELETE("/mcp-servers/:name", privileged, handlers.DeleteSettingsMCPServer)
-
-	settings.GET("/hooks", handlers.ListSettingsHooks)
-	settings.PUT("/hooks/:name", privileged, handlers.PutSettingsHook)
-	settings.DELETE("/hooks/:name", privileged, handlers.DeleteSettingsHook)
-
-	actions := settings.Group("/actions")
-	actions.POST("/restart", privileged, handlers.TriggerSettingsRestart)
-	actions.GET("/restart/:operation_id", handlers.GetSettingsRestartStatus)
 }
 
 func registerVaultRoutes(api gin.IRouter, handlers *Handlers) {

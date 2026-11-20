@@ -52,8 +52,8 @@ type mcpAuthRepairPaths struct {
 }
 
 func (n *daemonNativeTools) mcpAuthToolBindings(
-	statusAvailability toolspkg.NativeAvailabilityFunc,
-	authAvailability toolspkg.NativeAvailabilityFunc,
+	statusAvailability *toolspkg.NativeAvailabilityGroup,
+	authAvailability *toolspkg.NativeAvailabilityGroup,
 ) map[toolspkg.ToolID]nativeToolBinding {
 	return map[toolspkg.ToolID]nativeToolBinding{
 		toolspkg.ToolIDMCPImport: {
@@ -194,6 +194,8 @@ func mcpRuntimeStatusByName(
 
 func mcpRuntimeProbeState(state settingspkg.MCPServerRuntimeState, fallback string) string {
 	switch state {
+	case settingspkg.MCPServerRuntimeStateOff:
+		return string(state)
 	case settingspkg.MCPServerRuntimeStateDead:
 		return "dead"
 	case settingspkg.MCPServerRuntimeStateReady:

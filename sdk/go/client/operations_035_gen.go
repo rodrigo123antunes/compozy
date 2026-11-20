@@ -11,6 +11,103 @@ import (
 	"strings"
 )
 
+// SetSettingsMCPServerEnabled Turn one scoped MCP server on or off
+func (c *Client) SetSettingsMCPServerEnabled(ctx context.Context, params SetSettingsMCPServerEnabledParams, body SettingsMCPServerEnabledRequest) (*SettingsMCPServerResponse, error) {
+	path := "/api/settings/mcp-servers/{name}/enabled"
+	path = strings.ReplaceAll(path, "{name}", url.PathEscape(params.Name))
+	query := url.Values{}
+	query.Set("scope", params.Scope)
+	if params.WorkspaceID != nil {
+		query.Set("workspace_id", *params.WorkspaceID)
+	}
+	if params.Profile != nil {
+		query.Set("profile", *params.Profile)
+	}
+	if params.Owner != nil {
+		query.Set("owner", *params.Owner)
+	}
+	if params.DefinitionSource != nil {
+		query.Set("definition_source", *params.DefinitionSource)
+	}
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	var out SettingsMCPServerResponse
+	if err := c.doContent(ctx, "PUT", path, nil, body, &out, "", ""); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SetSettingsProviderEnabledParams carries the path, query, and header parameters.
+type SetSettingsProviderEnabledParams struct {
+	Name string `url:"name"`
+}
+
+// SetSettingsProviderEnabled Enable or disable one provider
+func (c *Client) SetSettingsProviderEnabled(ctx context.Context, params SetSettingsProviderEnabledParams, body SetSettingsProviderEnabledRequest) (*SettingsProviderEnabledResponse, error) {
+	path := "/api/settings/providers/{name}/enabled"
+	path = strings.ReplaceAll(path, "{name}", url.PathEscape(params.Name))
+	var out SettingsProviderEnabledResponse
+	if err := c.doContent(ctx, "PATCH", path, nil, body, &out, "", ""); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SetTaskExecutionProfileParams carries the path, query, and header parameters.
+type SetTaskExecutionProfileParams struct {
+	ID      string  `url:"id"`
+	Profile *string `url:"profile"`
+}
+
+// SetTaskExecutionProfile Replace one task execution profile
+func (c *Client) SetTaskExecutionProfile(ctx context.Context, params SetTaskExecutionProfileParams, body ExecutionProfile) (*TaskExecutionProfileResponse, error) {
+	path := "/api/tasks/{id}/execution-profile"
+	path = strings.ReplaceAll(path, "{id}", url.PathEscape(params.ID))
+	query := url.Values{}
+	if params.Profile != nil {
+		query.Set("profile", *params.Profile)
+	}
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	var out TaskExecutionProfileResponse
+	if err := c.doContent(ctx, "PUT", path, nil, body, &out, "", ""); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SetTaskWorktreePolicyParams carries the path, query, and header parameters.
+type SetTaskWorktreePolicyParams struct {
+	ID      string  `url:"id"`
+	Profile *string `url:"profile"`
+}
+
+// SetTaskWorktreePolicy Set one task worktree policy
+func (c *Client) SetTaskWorktreePolicy(ctx context.Context, params SetTaskWorktreePolicyParams, body WorktreePolicy) (*TaskExecutionProfileResponse, error) {
+	path := "/api/tasks/{id}/execution-profile/worktree"
+	path = strings.ReplaceAll(path, "{id}", url.PathEscape(params.ID))
+	query := url.Values{}
+	if params.Profile != nil {
+		query.Set("profile", *params.Profile)
+	}
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	var out TaskExecutionProfileResponse
+	if err := c.doContent(ctx, "PATCH", path, nil, body, &out, "", ""); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SetToolApprovalGrantParams carries the path, query, and header parameters.
+type SetToolApprovalGrantParams struct {
+	WorkspaceID string `url:"workspace_id"`
+}
+
 // SetToolApprovalGrant Set an explicit agent-wide or tool-wide native-tool approval decision
 func (c *Client) SetToolApprovalGrant(ctx context.Context, params SetToolApprovalGrantParams, body ToolApprovalGrantSetRequest) (*ToolApprovalGrantResponse, error) {
 	path := "/api/tool-approval-grants"
@@ -343,78 +440,6 @@ func (f StreamGlobalSessionFrame) AsSubagentUpdatedEvent() (*SubagentUpdatedEven
 // AsSubagentRemovedEvent decodes this payload as SubagentRemovedEvent.
 func (f StreamGlobalSessionFrame) AsSubagentRemovedEvent() (*SubagentRemovedEvent, error) {
 	var out SubagentRemovedEvent
-	if err := json.Unmarshal(f.Raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// AsSessionUsageChangedPayload decodes this payload as SessionUsageChangedPayload.
-func (f StreamGlobalSessionFrame) AsSessionUsageChangedPayload() (*SessionUsageChangedPayload, error) {
-	var out SessionUsageChangedPayload
-	if err := json.Unmarshal(f.Raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// AsSessionConsumerDegradedPayload decodes this payload as SessionConsumerDegradedPayload.
-func (f StreamGlobalSessionFrame) AsSessionConsumerDegradedPayload() (*SessionConsumerDegradedPayload, error) {
-	var out SessionConsumerDegradedPayload
-	if err := json.Unmarshal(f.Raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// AsSessionEventPayload decodes this payload as SessionEventPayload.
-func (f StreamGlobalSessionFrame) AsSessionEventPayload() (*SessionEventPayload, error) {
-	var out SessionEventPayload
-	if err := json.Unmarshal(f.Raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// AsTranscriptSnapshotPayload decodes this payload as TranscriptSnapshotPayload.
-func (f StreamGlobalSessionFrame) AsTranscriptSnapshotPayload() (*TranscriptSnapshotPayload, error) {
-	var out TranscriptSnapshotPayload
-	if err := json.Unmarshal(f.Raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// AsTranscriptDeltaPayload decodes this payload as TranscriptDeltaPayload.
-func (f StreamGlobalSessionFrame) AsTranscriptDeltaPayload() (*TranscriptDeltaPayload, error) {
-	var out TranscriptDeltaPayload
-	if err := json.Unmarshal(f.Raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// AsGoalSnapshotChangedPayload decodes this payload as GoalSnapshotChangedPayload.
-func (f StreamGlobalSessionFrame) AsGoalSnapshotChangedPayload() (*GoalSnapshotChangedPayload, error) {
-	var out GoalSnapshotChangedPayload
-	if err := json.Unmarshal(f.Raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// AsSessionCommandsChangedPayload decodes this payload as SessionCommandsChangedPayload.
-func (f StreamGlobalSessionFrame) AsSessionCommandsChangedPayload() (*SessionCommandsChangedPayload, error) {
-	var out SessionCommandsChangedPayload
-	if err := json.Unmarshal(f.Raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// AsErrorPayload decodes this payload as ErrorPayload.
-func (f StreamGlobalSessionFrame) AsErrorPayload() (*ErrorPayload, error) {
-	var out ErrorPayload
 	if err := json.Unmarshal(f.Raw, &out); err != nil {
 		return nil, err
 	}

@@ -1,5 +1,130 @@
 # Compozy Change Impact
 
+## Budgeted hosted MCP tool listing (GH-1869) — 2026-11-19
+
+- **Native tools.** `compozy__tool_search` accepts multi-word queries and ranks results by where
+  the words match; every query that matched before still matches. With a positive threshold on the
+  Claude ACP bridge, the callable deferred tools returned by `compozy__tool_search`,
+  `compozy__tool_list` and `compozy__tool_info` are registered under their real names. Public
+  result shapes are unchanged. No new tool id.
+- **CLI/HTTP/UDS.** No public verb, route or DTO change. The hidden `compozy tool mcp` bridge
+  receives the threshold from the daemon through a private flag, and the private bridge call
+  response carries up to 100 discovered tool ids (additive, omitted when empty).
+- **Extensibility, hooks and config.** New experimental key `tools.hosted_mcp.tool_list_threshold`
+  (default `0`, the full listing as before). Hooks see the same tool calls and results. Providers
+  other than the Claude ACP bridge keep the full listing.
+- **State and isolation.** No persisted state. Activation lives in one bridge process and is
+  limited to tools in that bind's own callable projection; policy, approvals and revocation are
+  still enforced per call. The served receipt still carries the digest of the full projected
+  catalog. A replacement bind starts from the initial budget.
+- **Web, official skill, docs and QA.** Web unchanged. The site config reference,
+  `configuration.md`, `native-tools.md` and `tools-and-skills.md` describe the directory, schema
+  loading, the refresh-delay message and rediscovery after a relaunch. ET-048,
+  ET-compozy-native-tool-invocation, ET-mcp-protocol-interop and
+  RT-mcp-hot-activation-next-message carry the budgeted variant.
+
+## Pinned sessions carry their subtree and keep a manual order (GH-1859)
+
+- **Native tools.** `compozy__session_list` `pinned` now includes or leaves out every session a pin
+  carries (hierarchy children, their continuations, subagents; not forks or continuations of the
+  pin itself), and `sort: "pinned"` follows the manual Pinned order and pages by pin with whole
+  subtrees. `compozy__session_reorder` gains `pinned: true` to order Pinned. No new tool.
+- **CLI/HTTP/UDS.** The catalog and facets reads apply the lineage-aware filter; `sort=pinned`
+  cursors anchor a pin (a previous-version pinned cursor is refused once with
+  `ErrListCursorInvalid`). `PUT /api/workspaces/{workspace_id}/session-order/sessions` accepts
+  `pinned: true` (excludes `folder_id`); `compozy session reorder <id>... --pinned`. Additive DTO
+  field, generated through OpenAPI and both SDKs.
+- **Extensibility, hooks and config.** None.
+- **State and isolation.** New nullable `sessions.pin_position` (migration 00209), backfilled from
+  `pinned_at` order so existing pins keep their order; a new pin takes the top. A reorder needs the
+  layout scope's workspace and owner profile, trades only the listed pins' slots, and leaves
+  every parent, folder placement, and manual position untouched.
+- **Web, official skill, docs and QA.** The Pinned section nests each pin's subtree, counts pins,
+  and reorders pins by drag or Move up/Move down where the list reads one pair. The native tool
+  reference, sessions guide, generated CLI docs, release note, and ET-web-session-list-pinned
+  describe the new rule.
+
+## Built-in extension permanent removal and restore — 2026-11-18
+
+- **Native tools.** `compozy__extensions_restore` (mutating, `{"name"}`, write authority; result is the
+  `extension restore -o json` payload) and `compozy__extensions_removed_list` (read-only, `{}`; result is
+  the `extension removed -o json` payload) are registered with policy and result views. No tool removes
+  a built-in permanently: `compozy__extensions_remove` gains no `permanent` input, and permanent removal
+  requires operator scope, so agent sessions are denied.
+- **Extensibility, hooks and config.** Public surfaces are additive: `extension remove --permanent`,
+  `extension restore` and `extension removed`; `DELETE /api/extensions/{name}?permanent=true`,
+  `POST /api/extensions/{name}/restore` and `GET /api/extensions/removed-builtins` over HTTP and UDS; the
+  remove response gains `permanent` and `tombstoned_at`. Built-in manifests, hooks, extension SDK contracts
+  and extension APIs are unchanged. Generated OpenAPI and TypeScript types co-ship through codegen. No
+  config key is added, removed or changed: the tombstone is registry state.
+- **State and isolation.** New table `extension_builtin_tombstones` (migration `00209`, additive, keyed by
+  name, no foreign key to `extensions`). It is global to the daemon home, as bundled rows are global, not
+  per profile or workspace. Permanent removal commits the row delete and the tombstone in one transaction.
+  Restore clears the tombstone under the package mutation lock and writes it back when enrollment fails,
+  unless a partially enrolled row cannot be removed: then the row stays, no tombstone is written, and the
+  error is `extension_restore_failed`, so a row and a tombstone never coexist for one name. The rollback runs
+  detached from the caller's cancellation with a 15-second budget, so a canceled restore still writes the
+  tombstone back.
+  Boot and restore never touch a non-bundled row under the same name. An explicit install keeps the
+  tombstone in place (Q2 a). Input and secret values follow plain `remove` (Q1 a). Tool-policy trust follows
+  row presence, so a tombstoned built-in grants none. Extension MCP overrides (`extension_mcp_overrides`) are
+  kept by permanent removal and restore (Q1 b): neither path deletes them, which matches keeping user data by
+  default and plain `remove`.
+- **Errors and compensation.** New code `extension_removal_compensation_failed` (HTTP 500, category
+  `extension`, additive in `diagnosticcontract`). It answers a removal whose compensation failed after the
+  row delete: `ErrExtensionRemovalCompensationFailed` is the generic sentinel from `RemoveManagedExtension`,
+  and `ErrExtensionBuiltinRemovalCompensationFailed` wraps it for every permanent-removal compensation failure.
+  A failed compensation first returns the built-in to its removed state (no row, no install directory, tombstone
+  recorded), so the built-in sentinel's diagnostic suggests `compozy extension restore <name>`; the
+  generic one suggests `compozy doctor`. Decision (review round 01, F1, option a): the removal and its
+  tombstone stay committed after a failed compensation, and the code reports it, rather than rolling back
+  silently. Safety Invariant 1 in the spec records this. Install conflicts (`install`, local install,
+  marketplace install, and restore) now also carry the code `extension_exists` and the operation payload
+  with its diagnostic, and stay 409. This is intentional and additive.
+- **Web.** The extension remove dialog offers "Remove permanently" for bundled rows only, with the default
+  non-permanent. A "Removed built-ins" section lists tombstones with a restore action, and a successful
+  restore refreshes the installed list. Visual design belongs to the designer lane; E2E-004 covers the
+  browser journey.
+- **Official skill.** `skills/compozy/references/extensions.md` adds a Built-in Permanent Removal section,
+  routes built-in recovery to restore instead of reinstall, and notes that `--permanent` is not a dev-overlay
+  option. `native-tools.md` lists the two new tools and states that no tool removes a built-in permanently.
+- **Docs.** `packages/site/content/docs/cli/extension/{remove,restore,removed}.mdx` match the Cobra help, and
+  `make cli-docs-check` is clean. `extensions/install.mdx` documents operator-only permanent removal and the
+  restore and removed-list tool rows. The glossary entry "Built-in extension" awaits the operator's decision.
+- **QA.** `docs/qa/scenarios/ET-builtin-extension-permanent-removal.md` is the operator journey.
+  `ET-bundled-extension-trust.md` restart reconciliation mentions tombstones.
+- **Compatibility.** SD-013 regime 1 (one additive table) and regime 2 (additive surfaces; non-permanent
+  `remove` unchanged). No shim, deletion or ADR; the decisions live in the spec.
+
+## Turn off a configured MCP server (GH-1850, requirement 10)
+
+- **Native tools, CLI, HTTP and UDS.** MCP list and status reads expose off definitions. The
+  session MCP list returns `off` and a reason. `mcp disable` and `mcp enable` share the scoped,
+  owner-qualified settings route and generated client contract. Both explicit checks skip off servers.
+- **Config, persistence and extensibility.** `disabled` is additive in TOML and JSON. Existing
+  files default to on. Extension allocations add a default-on persisted switch without rewriting
+  manifests or changing hook contracts. Published agent and skill servers use a local preference
+  keyed by declaring file or extension instance. Definition digests and credential owners exclude the switch.
+- **Workspace and profile isolation.** Resolve the effective source before testing its switch.
+  An off workspace definition keeps its precedence, and the change targets the declaring scope.
+- **Web, docs and official skill.** Settings shows the switch and neutral Off status. The session
+  composer shows the reason. MCP docs and the official skill cover supported selectors, activation,
+  and checks. The Settings, session, CLI and next-message QA scenarios include the off/on walk.
+
+## Session list expansion depth menu (GH-1846) — 2026-11-18
+
+- **Native tools and CLI/HTTP/UDS.** No route, DTO, CLI or `compozy__*` tool changes.
+- **Extensibility, hooks and config.** No hook, extension or config key changes.
+- **State and isolation.** The per-window `foldAll` in the browser-local sessions sidebar store gains
+  a `groups` value; stored windows with `collapsed`, `expanded` or no value load unchanged, and an
+  unknown value loads as no choice. Windows stay independent.
+- **Web, docs and official skill.** The List toolbar's fold button becomes a menu: Expand groups
+  (folders and project groups open, child session lists folded, no subagent list opened), Expand all
+  and Collapse all, with the current choice checked and named by the trigger. A search still shows
+  matching child sessions, and a thread opened by hand stays open. The Kanban head keeps its single
+  button. `COPY.md` and `ET-web-sessions-board-card-actions-group-sort` record the walk; the official
+  skill does not describe sidebar folds and needs no change.
+
 ## Pinned sessions above the session list
 
 Owner: [#1827](https://github.com/compozy/compozy/issues/1827).
@@ -24,6 +149,24 @@ Owner: [#1827](https://github.com/compozy/compozy/issues/1827).
   pin mark; the Kanban board is unchanged. The native tool reference, the sessions guide, and the
   generated CLI docs describe pins; QA adds ET-web-session-list-pinned and notes the folder slot
   rule in ET-web-session-folders-manual-order.
+
+## Run-agent creation under an always-on Loop origin
+
+Owner: [#1851](https://github.com/compozy/compozy/issues/1851).
+
+- **Native tools and CLI/HTTP/UDS.** A Loop started through `compozy__loop_run` from an
+  always-on main or its descendant can create its run-owned worker with the effective creation
+  profile. Existing session reads expose the worker identity and parent/root lineage. The tool
+  schema, routes, DTOs and CLI output retain their current shapes.
+- **Extensibility, hooks and config.** Profile resolution before reservation is read-only. Session
+  creation still runs its existing hooks and verifies the pinned identity against the final
+  profile. Extension contracts and configuration retain their current shapes.
+- **State and isolation.** The same instance ceiling narrows tools and runtime authority, and
+  the binding uses the effective profile in the originating workspace and profile. Creation
+  identity mismatches remain errors. No persisted format or schema changes.
+- **Web, official skill, docs and QA.** Existing Web projections and the official Loop reference
+  already describe run-owned system sessions and origin lineage. `LP-run-agent-session-lifecycle`
+  adds the always-on main and descendant cases. CI owns the managed runtime regression.
 
 ||||||| 051fce873
 
@@ -72,6 +215,26 @@ Owner: branch `run/gateway-manual-6-digit-pairing-device-removal-backend-a87a117
   claiming a product walk.
 
 ||||||| parent of 9b114ea59 (feat: pin sessions above the session list)
+
+## MCP OAuth offline access, repair and early renewal
+
+Owners: [#1829](https://github.com/compozy/compozy/issues/1829), [#1830](https://github.com/compozy/compozy/issues/1830), and [#1831](https://github.com/compozy/compozy/issues/1831).
+
+- **Native tools and CLI/HTTP/UDS.** Tool discovery and calls can renew a token shortly before
+  expiry. `compozy__mcp_auth_status` and the equivalent CLI and API status surfaces show the
+  actual expiry and an actionable diagnostic for an unusable local registration. Credential
+  material stays redacted. The existing tools, routes and fields carry these outcomes.
+- **Extensibility, hooks and config.** Manual and extension-owned remotes share the OAuth flow.
+  Sign-in uses issuer-advertised offline access and honors issuer consent parameters. Extension
+  APIs, hooks and configuration shapes stay the same.
+- **State and isolation.** Access, refresh and registration state remain bound to the normalized
+  target, its definition, client and issuer. Existing SQLite rows and the CIMD compatibility
+  loader support renewal in place. Transient failures retain the bound access token and refresh
+  grant. Known local registration failures leave stored credentials available for repair.
+- **Web, official skill, docs and QA.** Settings uses its existing status and reauthorization
+  controls. The MCP configuration guide and official skill describe when renewal or sign-in is
+  needed. The ET-api-mcp-oauth-endpoints and ET-web-mcp-status-matrix scenarios cover the same
+  outcomes through the existing status fields and controls.
 
 ## MCP OAuth refresh for CIMD clients
 
@@ -6663,6 +6826,40 @@ Main CI is the only execution gate under the release directive.
   `RT-daemon-restart-continuation` and `TestBootResumesInstancesAfterServersStart` cover the first
   Heartbeat, a refused reopen and operator stops.
 
+## Pre-registered remote MCP OAuth and discovery
+
+Owner: [#1839](https://github.com/compozy/compozy/issues/1839).
+
+- **Native tools, CLI, HTTP and UDS.** Existing MCP status and check operations retain their
+  response shapes. Discovery reports redacted HTTP, JSON-RPC or connection details. An observed
+  rejection of the current bearer credential makes auth status report `expired` when it can
+  refresh the credential, or `needs_login` when it needs a fresh sign-in.
+- **Config and persisted state.** Keep scopes as individual `auth.scopes` entries. Token responses
+  accept comma and space delimiters. The OAuth binding boundary recognizes previously persisted
+  comma-joined scopes. Connections record token rejection in the running daemon without changing
+  stored rows. A successful refresh or new sign-in clears the rejection for that credential target.
+- **Extensibility and isolation.** Outbound Streamable HTTP accepts an SDK-negotiated MCP
+  `2025-06-18` session. Authorization remains scoped to the existing target and definition, and
+  rejection is tied to the observed credential revision. Hook, SDK, and extension contracts retain
+  their existing shapes.
+- **Web, docs and QA.** Existing Web status renders the new diagnostic and sign-in state. Updated
+  the official MCP reference, MCP setup guide, `ET-cli-mcp-authorize`, and `ET-mcp-protocol-interop`.
+
+## Marketplace install during concurrent refresh
+
+Owner: [#1836](https://github.com/compozy/compozy/issues/1836).
+
+- **Native tools, CLI, HTTP and UDS.** Marketplace installs, previews, inspection and updates
+  can enter the package cache while cleanup waits for another operation to publish. A caller
+  waiting on the cache can cancel its request. Tool IDs, routes, flags and payloads stay the same.
+- **Extensibility, hooks, config and workspace isolation.** Cache cleanup still reads the current
+  catalog and installed references after active publications finish. It uses the same home cache,
+  workspace and profile selection, and cache budget. Extension, hook, config and storage contracts
+  stay the same.
+- **Web, docs and official skill.** The existing Marketplace install dialog can load while a
+  different source is still refreshing. Existing instructions and controls apply. The concurrent
+  refresh scenario is recorded in `ET-agent-plugin-marketplace-install`.
+
 ## Retryable hosted MCP bind refusal
 
 Owner: [#1838](https://github.com/compozy/compozy/issues/1838).
@@ -6679,3 +6876,43 @@ Owner: [#1838](https://github.com/compozy/compozy/issues/1838).
 - **Docs, official skill and QA.** The MCP reference and `RT-mcp-reload-failure-recovery`
   describe first-bind and idle-rebind recovery. Initial and subsequent hosted projections record
   a fixed cause class in daemon logs when they fail.
+
+## Hosted MCP catalog discovery
+
+Owner [#1850](https://github.com/compozy/compozy/issues/1850).
+
+- **Native tools and CLI/HTTP/UDS.** The hosted handshake returns ready tools while the daemon
+  discovers external catalogs. Session MCP list surfaces report why a configured server is missing.
+  Explicit checks force upstream discovery and keep the previous catalog after failure.
+- **Workspace and profile isolation.** Upstream subscriptions follow the resolved source and
+  credential binding. Background discovery requires a live session bind with source authority
+  and project consent. Sessions share one fallback refresh per binding. Servers without a live
+  subscription use the longer of the server's `ttlMs` hint and a 60-second minimum, with a
+  two-minute default. An unchanged listing retains the shared projection. Shared projections
+  use the registry's visibility class, including profile, workspace and effective session policy.
+- **Extensibility, config and user state.** Existing declaration formats, generated API shapes,
+  extension and hook interfaces, and persisted state support the same inputs. Hosted updates use
+  the existing tool-list notification.
+- **Web, docs and official skill.** The MCP controls render the existing state and reason fields.
+  The MCP docs and tools-and-skills reference explain discovery, refresh and cooldown.
+
+## Idle MCP projection refresh
+
+Owner: `perf/mcp-poll-churn`.
+
+- **Native tools and CLI/HTTP/UDS.** Session summaries and hosted streams retain their existing
+  refresh intervals, event payloads, and call-time authorization. A hosted bind can reuse its
+  immutable catalog when the observed inputs and projection epoch agree. Instance adoption,
+  ancestry changes, and check-in authority are observed at the existing refresh cadence.
+- **Hooks, config and extensibility.** The same catalog discovery, authored config watcher,
+  approval, and tool-call paths supply the projection inputs. External provider health and native
+  availability retain their bounded rechecks. Native availability dependencies come from the
+  bindings. Check-in authority includes the authored definition, committed approval, and main
+  session ceiling. A check-in summary also honors changes to the workspace configuration fence.
+- **Workspace and profile isolation.** Read batches share external inputs by their declared
+  provider scopes and share tool views by effective visibility. Runtime inventory dependencies
+  identify the exact accepted runtime context and its observed file revision. Instance and
+  approval identities read committed rows under the original profile and workspace rules. Cold
+  builds check that the instance, check-in binding, and approval inputs they consumed match the observation.
+- **Official skill, Web, docs and QA.** The MCP settings, summary events, hosted tool notifications,
+  and existing operator journeys use the same timing and contracts.

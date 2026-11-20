@@ -43,6 +43,10 @@ export const sessionKeys = {
   historyCleanupPreview: (profile: string, request: unknown) =>
     [...sessionKeys.historyCleanup(), "preview", profile.trim(), request] as const,
   workspaceLists: (workspace: string) => [...sessionKeys.lists(), workspace.trim()] as const,
+  catalogPage: (filters: SessionListFilters) =>
+    [...sessionKeys.workspaceLists(filters.workspace_id ?? ""), "page", filters] as const,
+  launchPreview: (filters: SessionListFilters) =>
+    [...sessionKeys.all, "launch-preview", filters] as const,
   /** One profile's session folders in a workspace; under the list family so catalog wakes reread it. */
   folders: (workspace: string, profile: string) =>
     [...sessionKeys.workspaceLists(workspace), "folders", profile.trim()] as const,
@@ -129,6 +133,11 @@ export const sessionKeys = {
   /** Short pages of the same list for a session row's subagent branch; parent invalidation reaches it. */
   subagentBranch: (workspace: string, id: string) =>
     [...sessionKeys.subagents(workspace, id), "branch"] as const,
+  /** A session's side chats; `session_side_changed` for this parent rereads every variant. */
+  sides: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "sides"] as const,
+  sidesList: (workspace: string, id: string, archived: boolean) =>
+    [...sessionKeys.sides(workspace, id), archived ? "archived" : "open"] as const,
   /** The session's daemon-owned monitors (composer monitor popover). */
   monitors: (workspace: string, id: string) =>
     [...sessionKeys.detail(workspace, id), "monitors"] as const,
